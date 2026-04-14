@@ -5,9 +5,11 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use byteorder::{BigEndian, ReadBytesExt};
-use serde::Serialize;
+use serde::ser::SerializeMap;
+use serde::{Serialize, Serializer};
 use sha1::{Digest as Sha1Digest, Sha1};
 
+use crate::crypto::lookup_algorithm_by_type;
 use crate::error::{AvbToolError as DynoError, Result};
 
 use crate::parser::{
@@ -49,7 +51,9 @@ pub struct AvbImageInfo {
     pub vbmeta_offset: u64,
     pub vbmeta_size: u64,
     pub header: AvbVBMetaHeader,
+    pub algorithm_name: String,
     pub public_key_sha1: Option<String>,
+    #[serde(serialize_with = "serialize_descriptors")]
     pub descriptors: Vec<DescriptorInfo>,
 }
 
@@ -98,6 +102,147 @@ pub enum DescriptorInfo {
         num_bytes_following: u64,
         body: Vec<u8>,
     },
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+fn serialize_descriptors<S: Serializer>(
+    descriptors: &[DescriptorInfo],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let mut seq = serializer.serialize_seq(Some(descriptors.len()))?;
+    for descriptor in descriptors {
+        seq.serialize_element(&JsonDescriptor(descriptor))?;
+    }
+    seq.end()
+}
+
+struct JsonDescriptor<'a>(&'a DescriptorInfo);
+
+impl<'a> Serialize for JsonDescriptor<'a> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(1))?;
+        match self.0 {
+            DescriptorInfo::Property { key, value } => {
+                #[derive(Serialize)]
+                struct V<'b> {
+                    key: &'b str,
+                    value: String,
+                }
+                map.serialize_entry("Property", &V {
+                    key,
+                    value: String::from_utf8_lossy(value).into_owned(),
+                })?;
+            }
+            DescriptorInfo::Hash { image_size, hash_algorithm, partition_name, salt, digest, flags } => {
+                #[derive(Serialize)]
+                struct V<'b> {
+                    image_size: u64,
+                    hash_algorithm: &'b str,
+                    partition_name: &'b str,
+                    salt: String,
+                    digest: String,
+                    flags: u32,
+                }
+                map.serialize_entry("Hash", &V {
+                    image_size: *image_size,
+                    hash_algorithm,
+                    partition_name,
+                    salt: bytes_to_hex(salt),
+                    digest: bytes_to_hex(digest),
+                    flags: *flags,
+                })?;
+            }
+            DescriptorInfo::Hashtree {
+                dm_verity_version, image_size, tree_offset, tree_size,
+                data_block_size, hash_block_size, fec_num_roots, fec_offset, fec_size,
+                hash_algorithm, partition_name, salt, root_digest, flags,
+            } => {
+                #[derive(Serialize)]
+                struct V<'b> {
+                    dm_verity_version: u32,
+                    image_size: u64,
+                    tree_offset: u64,
+                    tree_size: u64,
+                    data_block_size: u32,
+                    hash_block_size: u32,
+                    fec_num_roots: u32,
+                    fec_offset: u64,
+                    fec_size: u64,
+                    hash_algorithm: &'b str,
+                    partition_name: &'b str,
+                    salt: String,
+                    root_digest: String,
+                    flags: u32,
+                }
+                map.serialize_entry("Hashtree", &V {
+                    dm_verity_version: *dm_verity_version,
+                    image_size: *image_size,
+                    tree_offset: *tree_offset,
+                    tree_size: *tree_size,
+                    data_block_size: *data_block_size,
+                    hash_block_size: *hash_block_size,
+                    fec_num_roots: *fec_num_roots,
+                    fec_offset: *fec_offset,
+                    fec_size: *fec_size,
+                    hash_algorithm,
+                    partition_name,
+                    salt: bytes_to_hex(salt),
+                    root_digest: bytes_to_hex(root_digest),
+                    flags: *flags,
+                })?;
+            }
+            DescriptorInfo::KernelCmdline { flags, kernel_cmdline } => {
+                #[derive(Serialize)]
+                struct V<'b> {
+                    flags: u32,
+                    kernel_cmdline: &'b str,
+                }
+                map.serialize_entry("KernelCmdline", &V {
+                    flags: *flags,
+                    kernel_cmdline,
+                })?;
+            }
+            DescriptorInfo::ChainPartition { rollback_index_location, partition_name, public_key, flags } => {
+                #[derive(Serialize)]
+                struct V<'b> {
+                    rollback_index_location: u32,
+                    partition_name: &'b str,
+                    public_key_sha1: String,
+                    flags: u32,
+                }
+                let pk_sha1 = {
+                    let mut hasher = Sha1::new();
+                    hasher.update(public_key);
+                    format!("{:x}", hasher.finalize())
+                };
+                map.serialize_entry("ChainPartition", &V {
+                    rollback_index_location: *rollback_index_location,
+                    partition_name,
+                    public_key_sha1: pk_sha1,
+                    flags: *flags,
+                })?;
+            }
+            DescriptorInfo::Unknown { tag, num_bytes_following, .. } => {
+                #[derive(Serialize)]
+                struct V {
+                    tag: u64,
+                    num_bytes_following: u64,
+                }
+                map.serialize_entry("Unknown", &V {
+                    tag: *tag,
+                    num_bytes_following: *num_bytes_following,
+                })?;
+            }
+        }
+        map.end()
+    }
 }
 
 pub fn collect_image_paths(input: &Path) -> Result<Vec<PathBuf>> {
@@ -298,12 +443,16 @@ fn inspect_image(path: &Path, file_size: u64) -> Result<Option<AvbImageInfo>> {
             let blob = read_exact_at(&mut file, 0, u64_to_usize(vbmeta_size, "vbmeta size")?)?;
             let (header, parsed_vbmeta_size, public_key_sha1, descriptors) =
                 parse_vbmeta_blob(&blob)?;
+            let algorithm_name = lookup_algorithm_by_type(header.algorithm_type)
+                .map(|a| a.name.to_string())
+                .unwrap_or_else(|_| format!("UNKNOWN({})", header.algorithm_type));
             Ok(Some(AvbImageInfo {
                 image_type,
                 footer: None,
                 vbmeta_offset: 0,
                 vbmeta_size: parsed_vbmeta_size,
                 header,
+                algorithm_name,
                 public_key_sha1,
                 descriptors,
             }))
@@ -335,6 +484,9 @@ fn inspect_image(path: &Path, file_size: u64) -> Result<Option<AvbImageInfo>> {
                 u64_to_usize(footer.vbmeta_size, "footer vbmeta size")?,
             )?;
             let (header, _, public_key_sha1, descriptors) = parse_vbmeta_blob(&blob)?;
+            let algorithm_name = lookup_algorithm_by_type(header.algorithm_type)
+                .map(|a| a.name.to_string())
+                .unwrap_or_else(|_| format!("UNKNOWN({})", header.algorithm_type));
 
             Ok(Some(AvbImageInfo {
                 image_type,
@@ -342,6 +494,7 @@ fn inspect_image(path: &Path, file_size: u64) -> Result<Option<AvbImageInfo>> {
                 vbmeta_offset: footer.vbmeta_offset,
                 vbmeta_size: footer.vbmeta_size,
                 header,
+                algorithm_name,
                 public_key_sha1,
                 descriptors,
             }))
@@ -922,14 +1075,6 @@ fn format_property_value(value: &[u8]) -> String {
         }
     }
     format!("0x{}", bytes_to_hex(value))
-}
-
-fn bytes_to_hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(out, "{:02x}", byte);
-    }
-    out
 }
 
 fn sha1_hex(bytes: &[u8]) -> String {
