@@ -75,6 +75,26 @@ pub fn rebuild_vbmeta_image(
     key_spec: &str,
     algorithm_name: Option<&str>,
 ) -> Result<()> {
+    rebuild_vbmeta_image_with_overrides(
+        output_path,
+        original_vbmeta_path,
+        chained_images,
+        key_spec,
+        algorithm_name,
+        None,
+        None,
+    )
+}
+
+pub fn rebuild_vbmeta_image_with_overrides(
+    output_path: &Path,
+    original_vbmeta_path: &Path,
+    chained_images: &[&Path],
+    key_spec: &str,
+    algorithm_name: Option<&str>,
+    rollback_index: Option<u64>,
+    flags: Option<u32>,
+) -> Result<()> {
     let original_info = inspect_avb_image(original_vbmeta_path)?;
     let original_blob = load_vbmeta_blob(original_vbmeta_path)?;
     let pkmd = extract_public_key_metadata(&original_info.header, &original_blob)?;
@@ -91,8 +111,8 @@ pub fn rebuild_vbmeta_image(
         }),
         key_spec: Some(key_spec.to_string()),
         public_key_metadata: Some(pkmd),
-        rollback_index: original_info.header.rollback_index,
-        flags: original_info.header.flags,
+        rollback_index: rollback_index.unwrap_or(original_info.header.rollback_index),
+        flags: flags.unwrap_or(original_info.header.flags),
         rollback_index_location: original_info.header.rollback_index_location,
         properties: collect_properties(&descriptors),
         kernel_cmdlines: collect_kernel_cmdlines(&descriptors),

@@ -17,7 +17,7 @@ use avbtool_rs::footer::{
 };
 use avbtool_rs::info::{generate_info_report, scan_input};
 use avbtool_rs::image::load_vbmeta_blob;
-use avbtool_rs::resign::{ResignOutcome, resign_image};
+use avbtool_rs::resign::ResignOutcome;
 use avbtool_rs::verify::{ExpectedChainPartition, VerifyImageOptions, verify_image};
 use clap::{Parser, Subcommand, ValueEnum};
 use crc32fast::Hasher as Crc32Hasher;
@@ -332,6 +332,26 @@ enum Commands {
         rollback_index: Option<u64>,
         #[arg(long)]
         force: bool,
+    },
+    UpdatePartitionDescriptor {
+        #[arg(long)]
+        image: PathBuf,
+        #[arg(long)]
+        partition_image: PathBuf,
+        #[arg(long, short)]
+        output: PathBuf,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        algorithm: Option<String>,
+        #[arg(long)]
+        signing_helper: Option<String>,
+        #[arg(long)]
+        signing_helper_with_files: Option<String>,
+        #[arg(long)]
+        rollback_index: Option<u64>,
+        #[arg(long)]
+        flags: Option<u32>,
     },
     SetAbMetadata {
         #[arg(long)]
@@ -837,11 +857,39 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             force,
         } => {
             reject_unsupported_helper_args(signing_helper, signing_helper_with_files)?;
-            reject_unsupported_option("auto_resize", auto_resize)?;
-            reject_unsupported_option("rollback_index", rollback_index.is_some())?;
-            match resign_image(&image, &key, algorithm.as_deref(), force)? {
-            ResignOutcome::Resigned | ResignOutcome::SkippedUnsigned => Ok(()),
+            match avbtool_rs::resign::resign_image_with_options(
+                &image,
+                &key,
+                algorithm.as_deref(),
+                force,
+                rollback_index,
+                auto_resize,
+            )? {
+                ResignOutcome::Resigned | ResignOutcome::SkippedUnsigned => Ok(()),
             }
+        }
+        Commands::UpdatePartitionDescriptor {
+            image,
+            partition_image,
+            output,
+            key,
+            algorithm,
+            signing_helper,
+            signing_helper_with_files,
+            rollback_index,
+            flags,
+        } => {
+            reject_unsupported_helper_args(signing_helper, signing_helper_with_files)?;
+            avbtool_rs::builder::rebuild_vbmeta_image_with_overrides(
+                &output,
+                &image,
+                &[partition_image.as_path()],
+                &key,
+                algorithm.as_deref(),
+                rollback_index,
+                flags,
+            )?;
+            Ok(())
         }
         Commands::SetAbMetadata {
             misc_image,

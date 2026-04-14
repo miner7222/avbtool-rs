@@ -26,6 +26,17 @@ pub fn resign_image(
     algorithm_name: Option<&str>,
     force: bool,
 ) -> Result<ResignOutcome> {
+    resign_image_with_options(image_path, key_spec, algorithm_name, force, None, false)
+}
+
+pub fn resign_image_with_options(
+    image_path: &Path,
+    key_spec: &str,
+    algorithm_name: Option<&str>,
+    force: bool,
+    rollback_index: Option<u64>,
+    auto_resize: bool,
+) -> Result<ResignOutcome> {
     let key = load_key_from_spec(key_spec)?;
 
     let resolved_algo = match algorithm_name {
@@ -103,6 +114,9 @@ pub fn resign_image(
 
     let mut new_header = header.clone();
     new_header.algorithm_type = algorithm.algorithm_type;
+    if let Some(ri) = rollback_index {
+        new_header.rollback_index = ri;
+    }
     new_header.public_key_offset = new_pk_offset as u64;
     new_header.public_key_size = new_pk_size as u64;
     new_header.public_key_metadata_offset = if pkmd_blob.is_empty() {
@@ -169,17 +183,23 @@ pub fn resign_image(
         file.seek(SeekFrom::Start(footer_start))?;
         file.write_all(&footer_bytes)?;
     } else {
-        if new_vbmeta.len() as u64 > file_size {
+        if auto_resize {
             file.set_len(new_vbmeta.len() as u64)?;
-        }
-        file.seek(SeekFrom::Start(vbmeta_offset))?;
-        file.write_all(&new_vbmeta)?;
-        if (new_vbmeta.len() as u64) < file_size {
-            zero_fill(
-                &mut file,
-                vbmeta_offset + new_vbmeta.len() as u64,
-                file_size - new_vbmeta.len() as u64,
-            )?;
+            file.seek(SeekFrom::Start(vbmeta_offset))?;
+            file.write_all(&new_vbmeta)?;
+        } else {
+            if new_vbmeta.len() as u64 > file_size {
+                file.set_len(new_vbmeta.len() as u64)?;
+            }
+            file.seek(SeekFrom::Start(vbmeta_offset))?;
+            file.write_all(&new_vbmeta)?;
+            if (new_vbmeta.len() as u64) < file_size {
+                zero_fill(
+                    &mut file,
+                    vbmeta_offset + new_vbmeta.len() as u64,
+                    file_size - new_vbmeta.len() as u64,
+                )?;
+            }
         }
     }
 
