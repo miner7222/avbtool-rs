@@ -324,12 +324,46 @@ fn build_descriptor_list(args: &VbmetaImageArgs) -> Result<Vec<DescriptorInfo>> 
         });
     }
 
+    // Collect descriptors from included images with deduplication by partition_name.
+    // Matches avbtool.py behavior: last image wins for same partition_name.
+    // Descriptors without partition_name (e.g. Property) are always appended.
+    let mut named_descriptors: std::collections::BTreeMap<String, DescriptorInfo> =
+        std::collections::BTreeMap::new();
+    let mut unnamed_descriptors: Vec<DescriptorInfo> = Vec::new();
+
     for path in &args.include_descriptors_from_images {
         let info = inspect_avb_image(path)?;
-        descriptors.extend(info.descriptors);
+        for desc in info.descriptors {
+            if let Some(key) = descriptor_dedup_key(&desc) {
+                named_descriptors.insert(key, desc);
+            } else {
+                unnamed_descriptors.push(desc);
+            }
+        }
     }
 
+    // Unnamed descriptors first (Property etc.), then named in sorted key order
+    descriptors.extend(unnamed_descriptors);
+    descriptors.extend(named_descriptors.into_values());
+
     Ok(descriptors)
+}
+
+/// Build dedup key matching avbtool.py: `TypeName_partition_name`.
+/// Returns None for descriptors without partition_name (Property, KernelCmdline, Unknown).
+fn descriptor_dedup_key(desc: &DescriptorInfo) -> Option<String> {
+    match desc {
+        DescriptorInfo::Hash { partition_name, .. } => Some(format!("Hash_{partition_name}")),
+        DescriptorInfo::Hashtree { partition_name, .. } => {
+            Some(format!("Hashtree_{partition_name}"))
+        }
+        DescriptorInfo::ChainPartition { partition_name, .. } => {
+            Some(format!("ChainPartition_{partition_name}"))
+        }
+        DescriptorInfo::Property { .. }
+        | DescriptorInfo::KernelCmdline { .. }
+        | DescriptorInfo::Unknown { .. } => None,
+    }
 }
 
 fn collect_properties(descriptors: &[DescriptorInfo]) -> Vec<PropertySpec> {
