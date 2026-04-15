@@ -45,6 +45,10 @@ Implemented commands accept Python-style underscore flags such as `--partition_s
 
 Unsupported subcommands or unsupported advanced options fail with clear error instead of silent mismatch.
 
+## Upstream reference
+
+Based on AOSP `platform/external/avb` at commit [`4a4e2c8`](https://android.googlesource.com/platform/external/avb/+/4a4e2c8a6592b88cf18b10fe5406f53a2a5d26cf).
+
 ## Notes
 
 - `signing_helper` / `signing_helper_with_files` not implemented
