@@ -37,26 +37,6 @@ pub fn resign_image_with_options(
     rollback_index: Option<u64>,
     auto_resize: bool,
 ) -> Result<ResignOutcome> {
-    let key = load_key_from_spec(key_spec)?;
-
-    let resolved_algo = match algorithm_name {
-        Some(name) => name.to_string(),
-        None => key.algorithm()?,
-    };
-    let algorithm = lookup_algorithm_by_name(&resolved_algo)?;
-    if algorithm.name == "NONE" {
-        return Err(DynoError::Tool(
-            "Resigning requires a signed AVB algorithm, not NONE.".into(),
-        ));
-    }
-    if key.bits() as usize != algorithm.signature_num_bytes * 8 {
-        return Err(DynoError::Tool(format!(
-            "Requested algorithm {} does not match key size {}",
-            resolved_algo,
-            key.bits()
-        )));
-    }
-
     let mut file = OpenOptions::new().read(true).write(true).open(image_path)?;
     let file_size = file.metadata()?.len();
 
@@ -79,6 +59,104 @@ pub fn resign_image_with_options(
     file.read_exact(&mut vbmeta_blob)?;
 
     let header = AvbVBMetaHeader::from_reader(&vbmeta_blob[..256])?;
+
+    // Resolve target algorithm
+    let resolved_algo = match algorithm_name {
+        Some(name) => name.to_string(),
+        None => {
+            // Infer from key if provided, otherwise keep original
+            let key = load_key_from_spec(key_spec);
+            match key {
+                Ok(k) => k.algorithm().unwrap_or_else(|_| "NONE".to_string()),
+                Err(_) => "NONE".to_string(),
+            }
+        }
+    };
+    let algorithm = lookup_algorithm_by_name(&resolved_algo)?;
+
+    // NONE algorithm: only update header fields (rollback_index, flags) in-place
+    if algorithm.name == "NONE" {
+        if header.algorithm_type == 0 {
+            // Already NONE — just patch rollback_index in existing blob
+            let mut new_header = header.clone();
+            if let Some(ri) = rollback_index {
+                new_header.rollback_index = ri;
+            }
+            let header_bytes = encode_header(&new_header);
+            file.seek(SeekFrom::Start(vbmeta_offset))?;
+            file.write_all(&header_bytes)?;
+            info!(
+                "Updated rollback_index on unsigned image {}.",
+                image_path.display()
+            );
+            return Ok(ResignOutcome::Resigned);
+        }
+        if !force {
+            return Err(DynoError::Tool(
+                "Cannot change a signed image to NONE without --force.".into(),
+            ));
+        }
+        // --force: strip signature, rebuild as NONE
+        let auth_offset = 256;
+        let aux_offset = auth_offset + header.authentication_data_block_size as usize;
+        let aux_blob = &vbmeta_blob[aux_offset..];
+        let descriptors_blob = &aux_blob[header.descriptors_offset as usize
+            ..header.descriptors_offset as usize + header.descriptors_size as usize];
+        let pkmd_blob = &aux_blob[header.public_key_metadata_offset as usize
+            ..header.public_key_metadata_offset as usize
+                + header.public_key_metadata_size as usize];
+
+        let mut new_aux = Vec::new();
+        new_aux.extend_from_slice(descriptors_blob);
+        let pkmd_off = new_aux.len();
+        new_aux.extend_from_slice(pkmd_blob);
+        let new_aux_size = round_to_multiple(new_aux.len() as u64, 64) as usize;
+        new_aux.resize(new_aux_size, 0);
+
+        let mut new_header = header.clone();
+        new_header.algorithm_type = 0;
+        new_header.authentication_data_block_size = 0;
+        new_header.hash_offset = 0;
+        new_header.hash_size = 0;
+        new_header.signature_offset = 0;
+        new_header.signature_size = 0;
+        new_header.public_key_offset = 0;
+        new_header.public_key_size = 0;
+        new_header.public_key_metadata_offset = if pkmd_blob.is_empty() {
+            0
+        } else {
+            pkmd_off as u64
+        };
+        new_header.public_key_metadata_size = pkmd_blob.len() as u64;
+        new_header.descriptors_offset = 0;
+        new_header.descriptors_size = descriptors_blob.len() as u64;
+        new_header.auxiliary_data_block_size = new_aux_size as u64;
+        if let Some(ri) = rollback_index {
+            new_header.rollback_index = ri;
+        }
+
+        let header_bytes = encode_header(&new_header);
+        let mut new_vbmeta = header_bytes;
+        new_vbmeta.extend_from_slice(&new_aux);
+
+        write_vbmeta_to_image(&mut file, &new_vbmeta, vbmeta_offset, file_size, footer, auto_resize)?;
+        info!(
+            "Stripped signature and re-wrote {} as NONE.",
+            image_path.display()
+        );
+        return Ok(ResignOutcome::Resigned);
+    }
+
+    // Signed algorithm path
+    let key = load_key_from_spec(key_spec)?;
+    if key.bits() as usize != algorithm.signature_num_bytes * 8 {
+        return Err(DynoError::Tool(format!(
+            "Requested algorithm {} does not match key size {}",
+            resolved_algo,
+            key.bits()
+        )));
+    }
+
     if header.algorithm_type == 0 && !force {
         info!(
             "Skipping {} because original AVB algorithm is NONE. Use --force to sign unsigned AVB images.",
@@ -155,6 +233,23 @@ pub fn resign_image_with_options(
     new_vbmeta.extend_from_slice(&new_auth_blob);
     new_vbmeta.extend_from_slice(&new_aux_blob);
 
+    write_vbmeta_to_image(&mut file, &new_vbmeta, vbmeta_offset, file_size, footer, auto_resize)?;
+    info!(
+        "Successfully re-signed {} using pure Rust ({}).",
+        image_path.display(),
+        resolved_algo
+    );
+    Ok(ResignOutcome::Resigned)
+}
+
+fn write_vbmeta_to_image(
+    file: &mut std::fs::File,
+    new_vbmeta: &[u8],
+    vbmeta_offset: u64,
+    file_size: u64,
+    footer: Option<AvbFooter>,
+    auto_resize: bool,
+) -> Result<()> {
     if let Some(mut footer) = footer {
         let footer_start = file_size
             .checked_sub(64)
@@ -171,9 +266,9 @@ pub fn resign_image_with_options(
         }
 
         file.seek(SeekFrom::Start(vbmeta_offset))?;
-        file.write_all(&new_vbmeta)?;
+        file.write_all(new_vbmeta)?;
         zero_fill(
-            &mut file,
+            file,
             vbmeta_offset + new_vbmeta.len() as u64,
             available_space - new_vbmeta.len() as u64,
         )?;
@@ -182,33 +277,25 @@ pub fn resign_image_with_options(
         let footer_bytes = encode_footer(&footer);
         file.seek(SeekFrom::Start(footer_start))?;
         file.write_all(&footer_bytes)?;
+    } else if auto_resize {
+        file.set_len(new_vbmeta.len() as u64)?;
+        file.seek(SeekFrom::Start(vbmeta_offset))?;
+        file.write_all(new_vbmeta)?;
     } else {
-        if auto_resize {
+        if new_vbmeta.len() as u64 > file_size {
             file.set_len(new_vbmeta.len() as u64)?;
-            file.seek(SeekFrom::Start(vbmeta_offset))?;
-            file.write_all(&new_vbmeta)?;
-        } else {
-            if new_vbmeta.len() as u64 > file_size {
-                file.set_len(new_vbmeta.len() as u64)?;
-            }
-            file.seek(SeekFrom::Start(vbmeta_offset))?;
-            file.write_all(&new_vbmeta)?;
-            if (new_vbmeta.len() as u64) < file_size {
-                zero_fill(
-                    &mut file,
-                    vbmeta_offset + new_vbmeta.len() as u64,
-                    file_size - new_vbmeta.len() as u64,
-                )?;
-            }
+        }
+        file.seek(SeekFrom::Start(vbmeta_offset))?;
+        file.write_all(new_vbmeta)?;
+        if (new_vbmeta.len() as u64) < file_size {
+            zero_fill(
+                file,
+                vbmeta_offset + new_vbmeta.len() as u64,
+                file_size - new_vbmeta.len() as u64,
+            )?;
         }
     }
-
-    info!(
-        "Successfully re-signed {} using pure Rust ({}).",
-        image_path.display(),
-        resolved_algo
-    );
-    Ok(ResignOutcome::Resigned)
+    Ok(())
 }
 
 fn encode_header(h: &AvbVBMetaHeader) -> Vec<u8> {

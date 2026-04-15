@@ -318,7 +318,7 @@ enum Commands {
     ResignImage {
         #[arg(long)]
         image: PathBuf,
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         key: String,
         #[arg(long)]
         algorithm: Option<String>,
