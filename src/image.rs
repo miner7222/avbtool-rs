@@ -166,6 +166,6 @@ pub fn default_vbmeta_header() -> AvbVBMetaHeader {
         rollback_index: 0,
         flags: 0,
         rollback_index_location: 0,
-        release_string: format!("avbtool-rs {}", env!("CARGO_PKG_VERSION")),
+        release_string: "avbtool 1.4.0".to_string(),
     }
 }

@@ -137,7 +137,7 @@ pub fn append_vbmeta_image(
     let block_size = 4096u64;
     if partition_size % block_size != 0 {
         return Err(DynoError::Validation(format!(
-            "Partition size {} is not a multiple of {}",
+            "Partition size of {} is not a multiple of the image block size {}.",
             partition_size, block_size
         )));
     }
@@ -243,11 +243,10 @@ fn build_vbmeta_blob_from_descriptors(
     header.signature_size = algorithm.signature_num_bytes as u64;
     header.public_key_offset = encoded_descriptors.len() as u64;
     header.public_key_size = encoded_public_key.len() as u64;
-    header.public_key_metadata_offset = if pkmd.is_empty() {
-        0
-    } else {
-        (encoded_descriptors.len() + encoded_public_key.len()) as u64
-    };
+    // Always set offset to computed position (matching AOSP avbtool.py behavior),
+    // even when metadata is empty. libavb ignores offset when size=0.
+    header.public_key_metadata_offset =
+        (encoded_descriptors.len() + encoded_public_key.len()) as u64;
     header.public_key_metadata_size = pkmd.len() as u64;
     header.descriptors_size = encoded_descriptors.len() as u64;
     header.rollback_index = args.rollback_index;

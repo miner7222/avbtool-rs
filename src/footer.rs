@@ -15,6 +15,10 @@ use crate::info::DescriptorInfo;
 use crate::parser::{AVB_FOOTER_SIZE, AvbFooter, AvbImageType, detect_avb_image_type};
 
 const DEFAULT_BLOCK_SIZE: u64 = 4096;
+/// AOSP MAX_VBMETA_SIZE: upper bound for vbmeta blob (64 KiB).
+const MAX_VBMETA_SIZE: u64 = 64 * 1024;
+/// AOSP MAX_FOOTER_SIZE: one full block reserved for the footer.
+const MAX_FOOTER_SIZE: u64 = 4096;
 const ZERO_HASHTREE_MAGIC: &[u8; 8] = b"ZeRoHaSH";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,31 +143,28 @@ pub fn add_hash_footer(image_filename: &Path, args: &HashFooterArgs) -> Result<(
         return Ok(());
     }
 
+    // Match AOSP: MAX_VBMETA_SIZE = 64*1024, MAX_FOOTER_SIZE = 4096
+    let max_metadata_size = MAX_VBMETA_SIZE + MAX_FOOTER_SIZE;
     let aligned_original_size = round_to_multiple(original_size, block_size);
     let vbmeta_padded_size = round_to_multiple(vbmeta_blob.len() as u64, block_size);
     let partition_size = if args.dynamic_partition_size {
-        round_to_multiple(
-            aligned_original_size + vbmeta_padded_size + block_size,
-            block_size,
-        )
+        round_to_multiple(original_size + max_metadata_size, block_size)
     } else {
         args.partition_size.unwrap_or_default()
     };
     if partition_size % block_size != 0 {
         return Err(DynoError::Validation(format!(
-            "Partition size {} is not a multiple of {}",
+            "Partition size of {} is not a multiple of the image block size {}.",
             partition_size, block_size
         )));
     }
 
-    let footer_start = partition_size
-        .checked_sub(AVB_FOOTER_SIZE)
-        .ok_or_else(|| DynoError::Validation("Partition too small for footer".into()))?;
-    let minimum_partition_size = aligned_original_size + vbmeta_padded_size + block_size;
-    if partition_size < minimum_partition_size {
+    let max_image_size = partition_size.saturating_sub(max_metadata_size);
+    if original_size > max_image_size {
         return Err(DynoError::Validation(format!(
-            "Partition size {} too small; need at least {} bytes",
-            partition_size, minimum_partition_size
+            "Image size of {} exceeds maximum image size of {} in order to fit \
+             in a partition size of {}.",
+            original_size, max_image_size, partition_size
         )));
     }
 
@@ -173,6 +174,7 @@ pub fn add_hash_footer(image_filename: &Path, args: &HashFooterArgs) -> Result<(
     }
 
     let vbmeta_offset = aligned_original_size;
+    let footer_start = partition_size - AVB_FOOTER_SIZE;
     write_padded_blob(&mut file, vbmeta_offset, &vbmeta_blob, vbmeta_padded_size)?;
     if footer_start > vbmeta_offset + vbmeta_padded_size {
         zero_fill(
@@ -291,25 +293,26 @@ pub fn add_hashtree_footer(image_filename: &Path, args: &HashtreeFooterArgs) -> 
 
     let hash_tree_padded_size = round_to_multiple(hash_tree.len() as u64, DEFAULT_BLOCK_SIZE);
     let vbmeta_padded_size = round_to_multiple(vbmeta_blob.len() as u64, DEFAULT_BLOCK_SIZE);
+    // AOSP: max_metadata_size = max_fec_size + max_tree_size + MAX_VBMETA_SIZE + MAX_FOOTER_SIZE
+    let max_metadata_size = hash_tree_padded_size + MAX_VBMETA_SIZE + MAX_FOOTER_SIZE;
     let partition_size = args.partition_size.unwrap_or(
         aligned_image_size + hash_tree_padded_size + vbmeta_padded_size + DEFAULT_BLOCK_SIZE,
     );
-    if partition_size % DEFAULT_BLOCK_SIZE != 0 {
+    if partition_size > 0 && partition_size % DEFAULT_BLOCK_SIZE != 0 {
         return Err(DynoError::Validation(format!(
-            "Partition size {} is not a multiple of {}",
+            "Partition size of {} is not a multiple of the image block size {}.",
             partition_size, DEFAULT_BLOCK_SIZE
         )));
     }
-    let footer_start = partition_size
-        .checked_sub(AVB_FOOTER_SIZE)
-        .ok_or_else(|| DynoError::Validation("Partition too small for footer".into()))?;
-    let minimum_partition_size =
-        aligned_image_size + hash_tree_padded_size + vbmeta_padded_size + DEFAULT_BLOCK_SIZE;
-    if partition_size < minimum_partition_size {
-        return Err(DynoError::Validation(format!(
-            "Partition size {} too small; need at least {} bytes",
-            partition_size, minimum_partition_size
-        )));
+    if partition_size > 0 {
+        let max_image_size = partition_size.saturating_sub(max_metadata_size);
+        if original_size > max_image_size {
+            return Err(DynoError::Validation(format!(
+                "Image size of {} exceeds maximum image size of {} in order to fit \
+                 in a partition size of {}.",
+                original_size, max_image_size, partition_size
+            )));
+        }
     }
 
     file.set_len(original_size)?;
@@ -321,6 +324,7 @@ pub fn add_hashtree_footer(image_filename: &Path, args: &HashtreeFooterArgs) -> 
         write_padded_blob(&mut file, tree_offset, &hash_tree, hash_tree_padded_size)?;
     }
     let vbmeta_offset = tree_offset + hash_tree_padded_size;
+    let footer_start = partition_size - AVB_FOOTER_SIZE;
     write_padded_blob(&mut file, vbmeta_offset, &vbmeta_blob, vbmeta_padded_size)?;
     if footer_start > vbmeta_offset + vbmeta_padded_size {
         zero_fill(
@@ -420,7 +424,7 @@ pub fn zero_hashtree(image_filename: &Path) -> Result<()> {
 pub fn resize_image(image_filename: &Path, partition_size: u64) -> Result<()> {
     if partition_size % DEFAULT_BLOCK_SIZE != 0 {
         return Err(DynoError::Validation(format!(
-            "Partition size {} is not a multiple of {}",
+            "Partition size of {} is not a multiple of the image block size {}.",
             partition_size, DEFAULT_BLOCK_SIZE
         )));
     }
