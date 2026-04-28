@@ -53,7 +53,6 @@ Based on AOSP `platform/external/avb` at commit [`4a4e2c8`](https://android.goog
 
 - `signing_helper` / `signing_helper_with_files` not implemented
 - ML-DSA not implemented
-- FEC generation/verification is not implemented; `add_hashtree_footer` supports pure Rust no-FEC flow
 - ATX certificate commands are not implemented yet
 
 ## Build

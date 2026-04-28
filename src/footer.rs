@@ -10,6 +10,7 @@ use sha2::{Digest as Sha2Digest, Sha256, Sha512};
 use crate::builder::{ChainPartitionSpec, PropertySpec, VbmetaImageArgs, build_vbmeta_blob};
 use crate::crypto::{round_to_multiple, round_to_pow2};
 use crate::error::{AvbToolError as DynoError, Result};
+use crate::fec::{FEC_BLOCKSIZE, fec_size_for_input, generate_fec_from_image};
 use crate::image::inspect_avb_image;
 use crate::info::DescriptorInfo;
 use crate::parser::{AVB_FOOTER_SIZE, AvbFooter, AvbImageType, detect_avb_image_type};
@@ -92,14 +93,11 @@ pub fn add_hash_footer(image_filename: &Path, args: &HashFooterArgs) -> Result<(
         .map(|footer| footer.original_image_size)
         .unwrap_or(file.metadata()?.len());
     let digest_size = hash_digest_size(&args.hash_algorithm)? as u64;
-    let salt = args
-        .salt
-        .clone()
-        .unwrap_or(if args.use_persistent_digest {
-            Vec::new()
-        } else {
-            random_bytes(digest_size as usize)?
-        });
+    let salt = args.salt.clone().unwrap_or(if args.use_persistent_digest {
+        Vec::new()
+    } else {
+        random_bytes(digest_size as usize)?
+    });
     let digest = if args.use_persistent_digest {
         Vec::new()
     } else {
@@ -170,7 +168,11 @@ pub fn add_hash_footer(image_filename: &Path, args: &HashFooterArgs) -> Result<(
 
     file.set_len(original_size)?;
     if aligned_original_size > original_size {
-        zero_fill(&mut file, original_size, aligned_original_size - original_size)?;
+        zero_fill(
+            &mut file,
+            original_size,
+            aligned_original_size - original_size,
+        )?;
     }
 
     let vbmeta_offset = aligned_original_size;
@@ -194,12 +196,12 @@ pub fn add_hash_footer(image_filename: &Path, args: &HashFooterArgs) -> Result<(
     Ok(())
 }
 
+/// Default `num_roots` for AVB Reed-Solomon FEC. AOSP `external/avb/avbtool.py`
+/// uses `--fec_num_roots 2` by default; AVB consumers (libavb / dm-verity-fec)
+/// rarely override it.
+const AVB_DEFAULT_FEC_NUM_ROOTS: u32 = 2;
+
 pub fn add_hashtree_footer(image_filename: &Path, args: &HashtreeFooterArgs) -> Result<()> {
-    if args.generate_fec {
-        return Err(DynoError::UnsupportedOperation(
-            "Pure Rust FEC generation is not implemented yet.".into(),
-        ));
-    }
     let block_size = args.block_size as u64;
     let mut file = OpenOptions::new()
         .read(true)
@@ -221,8 +223,11 @@ pub fn add_hashtree_footer(image_filename: &Path, args: &HashtreeFooterArgs) -> 
         } else {
             random_bytes(digest_size)?
         });
-    let (hash_level_offsets, mut tree_size) =
-        calc_hash_level_offsets(aligned_image_size, block_size, (digest_size + digest_padding) as u64);
+    let (hash_level_offsets, mut tree_size) = calc_hash_level_offsets(
+        aligned_image_size,
+        block_size,
+        (digest_size + digest_padding) as u64,
+    );
     let (root_digest, mut hash_tree) = generate_hash_tree(
         image_filename,
         aligned_image_size,
@@ -247,6 +252,25 @@ pub fn add_hashtree_footer(image_filename: &Path, args: &HashtreeFooterArgs) -> 
         descriptor_flags |= 1 << 1;
     }
 
+    // Compute the FEC layout up front so the Hashtree descriptor can carry
+    // the correct `fec_offset` / `fec_size` / `fec_num_roots`. AVB FEC
+    // covers the partition's data area concatenated with the dm-verity
+    // hash tree (including its trailing zero pad to the next 4 KiB block).
+    // The FEC region itself follows the hash tree in the partition file
+    // and is rounded up to a 4 KiB boundary.
+    let hash_tree_padded_size = round_to_multiple(hash_tree.len() as u64, DEFAULT_BLOCK_SIZE);
+    let (fec_num_roots, fec_size, fec_offset) = if args.generate_fec && !args.no_hashtree {
+        let fec_input_size = aligned_image_size + hash_tree_padded_size;
+        let size = fec_size_for_input(fec_input_size, AVB_DEFAULT_FEC_NUM_ROOTS);
+        (
+            AVB_DEFAULT_FEC_NUM_ROOTS,
+            size,
+            tree_offset + hash_tree_padded_size,
+        )
+    } else {
+        (0u32, 0u64, 0u64)
+    };
+
     let vbmeta_args = VbmetaImageArgs {
         algorithm_name: args.algorithm_name.clone(),
         key_spec: args.key_spec.clone(),
@@ -263,9 +287,9 @@ pub fn add_hashtree_footer(image_filename: &Path, args: &HashtreeFooterArgs) -> 
             tree_size,
             data_block_size: args.block_size,
             hash_block_size: args.block_size,
-            fec_num_roots: 0,
-            fec_offset: 0,
-            fec_size: 0,
+            fec_num_roots,
+            fec_offset,
+            fec_size,
             hash_algorithm: args.hash_algorithm.clone(),
             partition_name: args.partition_name.clone(),
             salt,
@@ -291,12 +315,15 @@ pub fn add_hashtree_footer(image_filename: &Path, args: &HashtreeFooterArgs) -> 
         return Ok(());
     }
 
-    let hash_tree_padded_size = round_to_multiple(hash_tree.len() as u64, DEFAULT_BLOCK_SIZE);
     let vbmeta_padded_size = round_to_multiple(vbmeta_blob.len() as u64, DEFAULT_BLOCK_SIZE);
     // AOSP: max_metadata_size = max_fec_size + max_tree_size + MAX_VBMETA_SIZE + MAX_FOOTER_SIZE
-    let max_metadata_size = hash_tree_padded_size + MAX_VBMETA_SIZE + MAX_FOOTER_SIZE;
+    let max_metadata_size = hash_tree_padded_size + fec_size + MAX_VBMETA_SIZE + MAX_FOOTER_SIZE;
     let partition_size = args.partition_size.unwrap_or(
-        aligned_image_size + hash_tree_padded_size + vbmeta_padded_size + DEFAULT_BLOCK_SIZE,
+        aligned_image_size
+            + hash_tree_padded_size
+            + fec_size
+            + vbmeta_padded_size
+            + DEFAULT_BLOCK_SIZE,
     );
     if partition_size > 0 && partition_size % DEFAULT_BLOCK_SIZE != 0 {
         return Err(DynoError::Validation(format!(
@@ -323,7 +350,32 @@ pub fn add_hashtree_footer(image_filename: &Path, args: &HashtreeFooterArgs) -> 
     if hash_tree_padded_size > 0 {
         write_padded_blob(&mut file, tree_offset, &hash_tree, hash_tree_padded_size)?;
     }
-    let vbmeta_offset = tree_offset + hash_tree_padded_size;
+
+    // Compute and write the FEC region. The encoder reads the data area +
+    // hash tree (already on disk by this point) and emits parity bytes
+    // padded out to the next 4 KiB. We flush our own write handle first
+    // so the FEC reader sees the bytes we just laid down.
+    if fec_size > 0 {
+        file.flush()?;
+        let fec_bytes = generate_fec_from_image(image_filename, fec_offset, fec_num_roots)?;
+        if fec_bytes.len() as u64 != fec_size {
+            return Err(DynoError::Tool(format!(
+                "FEC encoder produced {} bytes but descriptor expects {}",
+                fec_bytes.len(),
+                fec_size
+            )));
+        }
+        if fec_size % FEC_BLOCKSIZE != 0 {
+            return Err(DynoError::Tool(format!(
+                "Computed FEC size {} is not a multiple of FEC_BLOCKSIZE {}",
+                fec_size, FEC_BLOCKSIZE
+            )));
+        }
+        file.seek(SeekFrom::Start(fec_offset))?;
+        file.write_all(&fec_bytes)?;
+    }
+
+    let vbmeta_offset = tree_offset + hash_tree_padded_size + fec_size;
     let footer_start = partition_size - AVB_FOOTER_SIZE;
     write_padded_blob(&mut file, vbmeta_offset, &vbmeta_blob, vbmeta_padded_size)?;
     if footer_start > vbmeta_offset + vbmeta_padded_size {
@@ -413,7 +465,10 @@ pub fn zero_hashtree(image_filename: &Path) -> Result<()> {
         ));
     }
 
-    let mut file = OpenOptions::new().read(true).write(true).open(image_filename)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(image_filename)?;
     write_zeroed_region(&mut file, tree_offset, tree_size)?;
     if fec_offset > 0 && fec_size > 0 {
         write_zeroed_region(&mut file, fec_offset, fec_size)?;
@@ -433,7 +488,10 @@ pub fn resize_image(image_filename: &Path, partition_size: u64) -> Result<()> {
     let footer = info
         .footer
         .ok_or_else(|| DynoError::Validation("Given image does not have a footer.".into()))?;
-    let vbmeta_end_offset = round_to_multiple(footer.vbmeta_offset + footer.vbmeta_size, DEFAULT_BLOCK_SIZE);
+    let vbmeta_end_offset = round_to_multiple(
+        footer.vbmeta_offset + footer.vbmeta_size,
+        DEFAULT_BLOCK_SIZE,
+    );
     let minimum_partition_size = vbmeta_end_offset + DEFAULT_BLOCK_SIZE;
     if partition_size < minimum_partition_size {
         return Err(DynoError::Validation(format!(
@@ -442,7 +500,10 @@ pub fn resize_image(image_filename: &Path, partition_size: u64) -> Result<()> {
         )));
     }
 
-    let mut file = OpenOptions::new().read(true).write(true).open(image_filename)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(image_filename)?;
     file.set_len(partition_size)?;
     let footer_start = partition_size - AVB_FOOTER_SIZE;
     write_footer(
@@ -563,7 +624,10 @@ where
         last_level_output = level_output;
     }
 
-    Ok((hash_bytes(hash_algorithm, salt, &last_level_output)?, hash_ret))
+    Ok((
+        hash_bytes(hash_algorithm, salt, &last_level_output)?,
+        hash_ret,
+    ))
 }
 
 pub fn hash_digest_size(hash_algorithm: &str) -> Result<usize> {
@@ -610,7 +674,9 @@ pub(crate) fn hash_file_prefix(
         "sha1" => {
             let mut hasher = Sha1::new();
             Sha1Digest::update(&mut hasher, salt);
-            hash_reader_prefix(&mut file, size, &mut |chunk| Sha1Digest::update(&mut hasher, chunk))?;
+            hash_reader_prefix(&mut file, size, &mut |chunk| {
+                Sha1Digest::update(&mut hasher, chunk)
+            })?;
             Ok(hasher.finalize().to_vec())
         }
         "sha256" => {
@@ -631,9 +697,9 @@ pub(crate) fn hash_file_prefix(
             hasher.update(salt);
             hash_reader_prefix(&mut file, size, &mut |chunk| hasher.update(chunk))?;
             let mut out = vec![0u8; 32];
-            hasher
-                .finalize_variable(&mut out)
-                .map_err(|error| DynoError::Tool(format!("Failed to finalize blake2b: {}", error)))?;
+            hasher.finalize_variable(&mut out).map_err(|error| {
+                DynoError::Tool(format!("Failed to finalize blake2b: {}", error))
+            })?;
             Ok(out)
         }
         other => Err(DynoError::UnsupportedOperation(format!(
@@ -669,9 +735,9 @@ pub(crate) fn hash_bytes(hash_algorithm: &str, salt: &[u8], data: &[u8]) -> Resu
             hasher.update(salt);
             hasher.update(data);
             let mut out = vec![0u8; 32];
-            hasher
-                .finalize_variable(&mut out)
-                .map_err(|error| DynoError::Tool(format!("Failed to finalize blake2b: {}", error)))?;
+            hasher.finalize_variable(&mut out).map_err(|error| {
+                DynoError::Tool(format!("Failed to finalize blake2b: {}", error))
+            })?;
             Ok(out)
         }
         other => Err(DynoError::UnsupportedOperation(format!(
@@ -747,7 +813,11 @@ fn write_padded_blob(file: &mut File, offset: u64, blob: &[u8], padded_size: u64
     file.seek(SeekFrom::Start(offset))?;
     file.write_all(blob)?;
     if padded_size > blob.len() as u64 {
-        zero_fill(file, offset + blob.len() as u64, padded_size - blob.len() as u64)?;
+        zero_fill(
+            file,
+            offset + blob.len() as u64,
+            padded_size - blob.len() as u64,
+        )?;
     }
     Ok(())
 }

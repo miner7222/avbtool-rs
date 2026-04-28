@@ -3,6 +3,7 @@ pub mod image;
 pub mod crypto;
 pub mod builder;
 pub mod digest;
+pub mod fec;
 pub mod footer;
 pub mod info;
 pub mod parser;
