@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use byteorder::{BigEndian, WriteBytesExt};
 
 use crate::crypto::{
-    compute_hash_for_algorithm, load_key_from_spec, lookup_algorithm_by_name, round_to_multiple,
+    AvbKey, AvbMldsaKey, SignOptions, compute_hash_for_algorithm, is_mldsa_algorithm,
+    is_rsa_algorithm, load_key_from_spec, load_mldsa_key_from_spec, lookup_algorithm_by_name,
+    round_to_multiple,
 };
 use crate::error::{AvbToolError as DynoError, Result};
 use crate::image::{
@@ -14,7 +16,8 @@ use crate::image::{
     inspect_avb_image, load_vbmeta_blob,
 };
 use crate::info::DescriptorInfo;
-use crate::parser::{AVB_FOOTER_SIZE, AvbFooter, AvbImageType, detect_avb_image_type};
+use crate::parser::{AVB_FOOTER_SIZE, AvbFooter, sparse_err};
+use crate::sparse::ImageHandler;
 
 const DESCRIPTOR_HEADER_SIZE: usize = 16;
 const PROPERTY_DESCRIPTOR_SIZE: usize = 32;
@@ -55,8 +58,57 @@ pub struct VbmetaImageArgs {
     pub padding_size: u64,
 }
 
+/// Additive signing options for vbmeta build APIs.
+///
+/// Kept separate from VbmetaImageArgs so existing call sites remain
+/// source-compatible. Defaults preserve local pure-Rust signing.
+#[derive(Debug, Clone, Default)]
+pub struct BuildSignOptions {
+    pub sign: SignOptions,
+}
+
+/// Result of update_partition_descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdatePartitionDescriptorResult {
+    pub blob: Vec<u8>,
+    pub required_libavb_version_minor: u32,
+}
+
+// Box key material so enum variants stay compact under Clippy.
+enum SigningMaterial {
+    None,
+    Rsa(Box<AvbKey>),
+    Mldsa(Box<AvbMldsaKey>),
+}
+
+impl SigningMaterial {
+    fn encode_public_key(&self) -> Vec<u8> {
+        match self {
+            Self::None => Vec::new(),
+            Self::Rsa(key) => key.encode_public_key(),
+            Self::Mldsa(key) => key.encode_public_key(),
+        }
+    }
+
+    fn sign(&self, data: &[u8], algorithm_name: &str, options: &SignOptions) -> Result<Vec<u8>> {
+        match self {
+            Self::None => Ok(Vec::new()),
+            Self::Rsa(key) => key.sign_with_options(data, algorithm_name, options),
+            Self::Mldsa(key) => key.sign_with_options(data, algorithm_name, options),
+        }
+    }
+}
+
 pub fn make_vbmeta_image(output: &Path, args: &VbmetaImageArgs) -> Result<()> {
-    let blob = build_vbmeta_blob(args)?;
+    make_vbmeta_image_with_options(output, args, &BuildSignOptions::default())
+}
+
+pub fn make_vbmeta_image_with_options(
+    output: &Path,
+    args: &VbmetaImageArgs,
+    options: &BuildSignOptions,
+) -> Result<()> {
+    let blob = build_vbmeta_blob_with_options(args, options)?;
     let mut file = File::create(output)?;
     file.write_all(&blob)?;
     if args.padding_size > 0 {
@@ -95,6 +147,29 @@ pub fn rebuild_vbmeta_image_with_overrides(
     rollback_index: Option<u64>,
     flags: Option<u32>,
 ) -> Result<()> {
+    rebuild_vbmeta_image_with_options(
+        output_path,
+        original_vbmeta_path,
+        chained_images,
+        key_spec,
+        algorithm_name,
+        rollback_index,
+        flags,
+        &BuildSignOptions::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn rebuild_vbmeta_image_with_options(
+    output_path: &Path,
+    original_vbmeta_path: &Path,
+    chained_images: &[&Path],
+    key_spec: &str,
+    algorithm_name: Option<&str>,
+    rollback_index: Option<u64>,
+    flags: Option<u32>,
+    options: &BuildSignOptions,
+) -> Result<()> {
     let original_info = inspect_avb_image(original_vbmeta_path)?;
     let original_blob = load_vbmeta_blob(original_vbmeta_path)?;
     let pkmd = extract_public_key_metadata(&original_info.header, &original_blob)?;
@@ -105,8 +180,7 @@ pub fn rebuild_vbmeta_image_with_overrides(
 
     let args = VbmetaImageArgs {
         algorithm_name: algorithm_name.map(str::to_string).unwrap_or_else(|| {
-            load_key_from_spec(key_spec)
-                .and_then(|key| key.algorithm())
+            resolve_default_algorithm_name(key_spec)
                 .unwrap_or_else(|_| "SHA256_RSA2048".to_string())
         }),
         key_spec: Some(key_spec.to_string()),
@@ -124,9 +198,104 @@ pub fn rebuild_vbmeta_image_with_overrides(
         padding_size: 0,
     };
 
-    let blob = build_vbmeta_blob_from_descriptors(&args, descriptors)?;
+    let blob = build_vbmeta_blob_from_descriptors(&args, descriptors, options)?;
     fs::write(output_path, blob)?;
     Ok(())
+}
+
+/// Replace the matching hash/hashtree descriptor in a vbmeta image with the one
+/// from `partition_image`, then rebuild/sign using `args`.
+///
+/// Matches upstream update_partition_descriptor common-arg semantics as far as
+/// current builder types allow: replace the single matching Hash/Hashtree
+/// descriptor, preserve remaining original descriptors, then append any
+/// properties/cmdlines/chains/include descriptors supplied via `args`.
+pub fn update_partition_descriptor(
+    vbmeta_image: &Path,
+    partition_image: &Path,
+    args: &VbmetaImageArgs,
+) -> Result<UpdatePartitionDescriptorResult> {
+    update_partition_descriptor_with_options(
+        vbmeta_image,
+        partition_image,
+        args,
+        &BuildSignOptions::default(),
+    )
+}
+
+pub fn update_partition_descriptor_with_options(
+    vbmeta_image: &Path,
+    partition_image: &Path,
+    args: &VbmetaImageArgs,
+    options: &BuildSignOptions,
+) -> Result<UpdatePartitionDescriptorResult> {
+    let partition_info = inspect_avb_image(partition_image)?;
+    let partition_descriptors: Vec<_> = partition_info
+        .descriptors
+        .iter()
+        .filter(|descriptor| {
+            matches!(
+                descriptor,
+                DescriptorInfo::Hash { .. } | DescriptorInfo::Hashtree { .. }
+            )
+        })
+        .cloned()
+        .collect();
+    if partition_descriptors.is_empty() {
+        return Err(DynoError::Validation(
+            "Given partition image does not contain a hash or hashtree descriptor.".into(),
+        ));
+    }
+    if partition_descriptors.len() > 1 {
+        return Err(DynoError::Validation(
+            "Given partition image contains more than one hash or hashtree descriptor.".into(),
+        ));
+    }
+    let partition_descriptor = partition_descriptors.into_iter().next().unwrap();
+
+    let image_info = inspect_avb_image(vbmeta_image)?;
+    let mut descriptors = image_info.descriptors.clone();
+    let mut match_indexes = Vec::new();
+    for (index, descriptor) in descriptors.iter().enumerate() {
+        if descriptors_match_partition(descriptor, &partition_descriptor) {
+            match_indexes.push(index);
+        }
+    }
+    if match_indexes.is_empty() {
+        return Err(DynoError::Validation(
+            "Given image does not contain a hash or hashtree descriptor matching the given partition image.".into(),
+        ));
+    }
+    if match_indexes.len() > 1 {
+        return Err(DynoError::Validation(
+            "Found multiple hash or hashtree descriptors matching the given partition image."
+                .into(),
+        ));
+    }
+    descriptors[match_indexes[0]] = partition_descriptor;
+
+    let required_minor =
+        required_libavb_minor_for_update(args, partition_info.header.required_libavb_version_minor);
+
+    let mut build_args = args.clone();
+    if build_args.flags == 0 {
+        build_args.flags = image_info.header.flags;
+    }
+    if build_args.release_string.is_none() {
+        build_args.release_string = Some(image_info.header.release_string.clone());
+    }
+
+    let descriptors = append_args_descriptors(descriptors, &build_args)?;
+    let blob = build_vbmeta_blob_from_descriptors_with_minor(
+        &build_args,
+        descriptors,
+        options,
+        Some(required_minor),
+    )?;
+    Ok(UpdatePartitionDescriptorResult {
+        blob,
+        required_libavb_version_minor: required_minor,
+    })
 }
 
 pub fn append_vbmeta_image(
@@ -134,93 +303,113 @@ pub fn append_vbmeta_image(
     vbmeta_image_filename: &Path,
     partition_size: u64,
 ) -> Result<()> {
-    let block_size = 4096u64;
-    if partition_size % block_size != 0 {
+    let mut image = ImageHandler::open(image_filename, false).map_err(sparse_err)?;
+    let block_size = u64::from(image.block_size());
+    if !partition_size.is_multiple_of(block_size) {
         return Err(DynoError::Validation(format!(
             "Partition size of {} is not a multiple of the image block size {}.",
             partition_size, block_size
         )));
     }
 
-    let vbmeta_blob = load_vbmeta_blob(vbmeta_image_filename)?;
-    let mut image = OpenOptions::new().read(true).write(true).open(image_filename)?;
-
-    let original_size = if image.metadata()?.len() >= AVB_FOOTER_SIZE {
-        match detect_avb_image_type(image_filename)? {
-            AvbImageType::Footer => {
-                image.seek(SeekFrom::End(-(AVB_FOOTER_SIZE as i64)))?;
-                let footer = AvbFooter::from_reader(&mut image)?;
-                image.set_len(footer.original_image_size)?;
+    let original_size = if image.image_size() >= AVB_FOOTER_SIZE {
+        image
+            .seek(image.image_size() - AVB_FOOTER_SIZE)
+            .map_err(sparse_err)?;
+        let footer_bytes = image.read(AVB_FOOTER_SIZE as usize).map_err(sparse_err)?;
+        match AvbFooter::from_reader(footer_bytes.as_slice()) {
+            Ok(footer) => {
+                image
+                    .truncate(footer.original_image_size)
+                    .map_err(sparse_err)?;
                 footer.original_image_size
             }
-            _ => image.metadata()?.len(),
+            Err(_) => image.image_size(),
         }
     } else {
-        image.metadata()?.len()
+        image.image_size()
     };
 
-    let current_size = image.metadata()?.len();
-    let aligned_size = round_to_multiple(current_size, block_size);
-    if aligned_size != current_size {
-        image.set_len(aligned_size)?;
-    }
+    let result = (|| {
+        let vbmeta_blob = load_vbmeta_blob(vbmeta_image_filename)?;
+        if image.image_size() % block_size != 0 {
+            if image.is_sparse() {
+                return Err(DynoError::Tool(
+                    "Sparse image size is not a multiple of block size.".into(),
+                ));
+            }
+            let padding_needed = block_size - (image.image_size() % block_size);
+            image
+                .truncate(image.image_size() + padding_needed)
+                .map_err(sparse_err)?;
+        }
 
-    let vbmeta_offset = aligned_size;
-    let vbmeta_padded_size = round_to_multiple(vbmeta_blob.len() as u64, block_size);
-    let footer_offset = partition_size
-        .checked_sub(AVB_FOOTER_SIZE)
-        .ok_or_else(|| DynoError::Validation("Partition size too small for AVB footer".into()))?;
-    if vbmeta_offset + vbmeta_padded_size > footer_offset {
-        return Err(DynoError::Validation(format!(
-            "Partition too small: need {} bytes before footer, have {}",
-            vbmeta_offset + vbmeta_padded_size,
-            footer_offset
-        )));
-    }
+        let vbmeta_offset = image.image_size();
+        let vbmeta_padded_size = round_to_multiple(vbmeta_blob.len() as u64, block_size);
+        let mut padded = vbmeta_blob.clone();
+        padded.resize(vbmeta_padded_size as usize, 0);
+        image.append_raw(&padded, true).map_err(sparse_err)?;
 
-    image.set_len(partition_size)?;
-    image.seek(SeekFrom::Start(vbmeta_offset))?;
-    image.write_all(&vbmeta_blob)?;
-    if vbmeta_padded_size > vbmeta_blob.len() as u64 {
-        image.write_all(&vec![0u8; (vbmeta_padded_size - vbmeta_blob.len() as u64) as usize])?;
-    }
+        let vbmeta_end = image.image_size();
+        if partition_size < vbmeta_end + block_size {
+            return Err(DynoError::Validation(format!(
+                "Partition too small: need {} bytes before footer, have {}",
+                vbmeta_end + block_size,
+                partition_size
+            )));
+        }
+        image
+            .append_dont_care(partition_size - vbmeta_end - block_size)
+            .map_err(sparse_err)?;
 
-    let footer = AvbFooter {
-        magic: *b"AVBf",
-        version_major: 1,
-        version_minor: 0,
-        original_image_size: original_size,
-        vbmeta_offset,
-        vbmeta_size: vbmeta_blob.len() as u64,
-    };
-    image.seek(SeekFrom::Start(footer_offset))?;
-    image.write_all(&encode_footer(&footer))?;
+        let mut footer_blob = vec![0u8; (block_size - AVB_FOOTER_SIZE) as usize];
+        footer_blob.extend_from_slice(&encode_footer(&AvbFooter {
+            magic: *b"AVBf",
+            version_major: 1,
+            version_minor: 0,
+            original_image_size: original_size,
+            vbmeta_offset,
+            vbmeta_size: vbmeta_blob.len() as u64,
+        }));
+        image.append_raw(&footer_blob, true).map_err(sparse_err)?;
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        let _ = image.truncate(original_size);
+        return Err(err);
+    }
     Ok(())
 }
 
 pub fn build_vbmeta_blob(args: &VbmetaImageArgs) -> Result<Vec<u8>> {
+    build_vbmeta_blob_with_options(args, &BuildSignOptions::default())
+}
+
+pub fn build_vbmeta_blob_with_options(
+    args: &VbmetaImageArgs,
+    options: &BuildSignOptions,
+) -> Result<Vec<u8>> {
     let descriptors = build_descriptor_list(args)?;
-    build_vbmeta_blob_from_descriptors(args, descriptors)
+    build_vbmeta_blob_from_descriptors(args, descriptors, options)
 }
 
 fn build_vbmeta_blob_from_descriptors(
     args: &VbmetaImageArgs,
+    descriptors: Vec<DescriptorInfo>,
+    options: &BuildSignOptions,
+) -> Result<Vec<u8>> {
+    build_vbmeta_blob_from_descriptors_with_minor(args, descriptors, options, None)
+}
+
+fn build_vbmeta_blob_from_descriptors_with_minor(
+    args: &VbmetaImageArgs,
     mut descriptors: Vec<DescriptorInfo>,
+    options: &BuildSignOptions,
+    required_minor_override: Option<u32>,
 ) -> Result<Vec<u8>> {
     let algorithm = lookup_algorithm_by_name(&args.algorithm_name)?;
-    let key = match algorithm.name {
-        "NONE" => {
-            if args.key_spec.is_some() {
-                return Err(DynoError::Validation(
-                    "Algorithm NONE cannot be used with a signing key.".into(),
-                ));
-            }
-            None
-        }
-        _ => Some(load_key_from_spec(args.key_spec.as_deref().ok_or_else(|| {
-            DynoError::Validation("Signing key required for selected algorithm.".into())
-        })?)?),
-    };
+    let key = load_signing_material(args, algorithm.name)?;
 
     descriptors.sort_by_key(descriptor_sort_key);
     let encoded_descriptors = descriptors
@@ -229,14 +418,22 @@ fn build_vbmeta_blob_from_descriptors(
         .collect::<Result<Vec<_>>>()?
         .concat();
 
-    let encoded_public_key = key
-        .as_ref()
-        .map(|key| key.encode_public_key())
-        .unwrap_or_default();
+    let encoded_public_key = key.encode_public_key();
+    if algorithm.public_key_num_bytes > 0
+        && encoded_public_key.len() != algorithm.public_key_num_bytes
+    {
+        return Err(DynoError::Validation(format!(
+            "Key is wrong size for algorithm {} (encoded {} bytes, expected {})",
+            algorithm.name,
+            encoded_public_key.len(),
+            algorithm.public_key_num_bytes
+        )));
+    }
     let pkmd = args.public_key_metadata.clone().unwrap_or_default();
 
     let mut header = default_vbmeta_header();
-    header.required_libavb_version_minor = required_libavb_minor(args);
+    header.required_libavb_version_minor =
+        required_minor_override.unwrap_or_else(|| required_libavb_minor(args));
     header.algorithm_type = algorithm.algorithm_type;
     header.hash_size = algorithm.hash_num_bytes as u64;
     header.signature_offset = algorithm.hash_num_bytes as u64;
@@ -276,11 +473,12 @@ fn build_vbmeta_blob_from_descriptors(
 
     let mut data_to_sign = header_bytes.clone();
     data_to_sign.extend_from_slice(&aux);
+    // ML-DSA uses an empty external hash (hash_num_bytes == 0).
     let hash = compute_hash_for_algorithm(algorithm, &data_to_sign)?;
-    let signature = if let Some(key) = key {
-        key.sign(&data_to_sign, algorithm.name)?
-    } else {
+    let signature = if algorithm.name == "NONE" {
         Vec::new()
+    } else {
+        key.sign(&data_to_sign, algorithm.name, &options.sign)?
     };
 
     let mut auth = Vec::new();
@@ -294,9 +492,59 @@ fn build_vbmeta_blob_from_descriptors(
     Ok(blob)
 }
 
-fn build_descriptor_list(args: &VbmetaImageArgs) -> Result<Vec<DescriptorInfo>> {
-    let mut descriptors = Vec::new();
+fn load_signing_material(args: &VbmetaImageArgs, algorithm_name: &str) -> Result<SigningMaterial> {
+    if algorithm_name == "NONE" {
+        if args.key_spec.is_some() {
+            return Err(DynoError::Validation(
+                "Algorithm NONE cannot be used with a signing key.".into(),
+            ));
+        }
+        return Ok(SigningMaterial::None);
+    }
 
+    let key_spec = args.key_spec.as_deref().ok_or_else(|| {
+        DynoError::Validation("Signing key required for selected algorithm.".into())
+    })?;
+
+    if is_mldsa_algorithm(algorithm_name) {
+        let key = load_mldsa_key_from_spec(key_spec)?;
+        if key.algorithm_name() != algorithm_name {
+            return Err(DynoError::Validation(format!(
+                "ML-DSA key algorithm {} does not match selected algorithm {}.",
+                key.algorithm_name(),
+                algorithm_name
+            )));
+        }
+        return Ok(SigningMaterial::Mldsa(Box::new(key)));
+    }
+
+    if is_rsa_algorithm(algorithm_name) {
+        return Ok(SigningMaterial::Rsa(Box::new(load_key_from_spec(
+            key_spec,
+        )?)));
+    }
+
+    Err(DynoError::UnsupportedOperation(format!(
+        "Unsupported AVB algorithm {algorithm_name}"
+    )))
+}
+
+fn resolve_default_algorithm_name(key_spec: &str) -> Result<String> {
+    if let Ok(key) = load_mldsa_key_from_spec(key_spec) {
+        return Ok(key.algorithm_name().to_string());
+    }
+    let key = load_key_from_spec(key_spec)?;
+    key.algorithm()
+}
+
+fn build_descriptor_list(args: &VbmetaImageArgs) -> Result<Vec<DescriptorInfo>> {
+    append_args_descriptors(Vec::new(), args)
+}
+
+fn append_args_descriptors(
+    mut descriptors: Vec<DescriptorInfo>,
+    args: &VbmetaImageArgs,
+) -> Result<Vec<DescriptorInfo>> {
     for property in &args.properties {
         descriptors.push(DescriptorInfo::Property {
             key: property.key.clone(),
@@ -327,8 +575,7 @@ fn build_descriptor_list(args: &VbmetaImageArgs) -> Result<Vec<DescriptorInfo>> 
     // Collect descriptors from included images with deduplication by partition_name.
     // Matches avbtool.py behavior: last image wins for same partition_name.
     // Descriptors without partition_name (e.g. Property) are always appended.
-    let mut named_descriptors: std::collections::BTreeMap<String, DescriptorInfo> =
-        std::collections::BTreeMap::new();
+    let mut named_descriptors: BTreeMap<String, DescriptorInfo> = BTreeMap::new();
     let mut unnamed_descriptors: Vec<DescriptorInfo> = Vec::new();
 
     for path in &args.include_descriptors_from_images {
@@ -347,6 +594,32 @@ fn build_descriptor_list(args: &VbmetaImageArgs) -> Result<Vec<DescriptorInfo>> 
     descriptors.extend(named_descriptors.into_values());
 
     Ok(descriptors)
+}
+
+fn descriptors_match_partition(existing: &DescriptorInfo, replacement: &DescriptorInfo) -> bool {
+    match (existing, replacement) {
+        (
+            DescriptorInfo::Hash {
+                partition_name: left,
+                ..
+            },
+            DescriptorInfo::Hash {
+                partition_name: right,
+                ..
+            },
+        )
+        | (
+            DescriptorInfo::Hashtree {
+                partition_name: left,
+                ..
+            },
+            DescriptorInfo::Hashtree {
+                partition_name: right,
+                ..
+            },
+        ) => left == right,
+        _ => false,
+    }
 }
 
 /// Build dedup key matching avbtool.py: `TypeName_partition_name`.
@@ -696,13 +969,46 @@ fn required_libavb_minor(args: &VbmetaImageArgs) -> u32 {
     if args.rollback_index_location > 0 {
         required_minor = required_minor.max(2);
     }
-    if args.chain_partitions.iter().any(|chain| (chain.flags & 1) != 0) {
+    if args
+        .chain_partitions
+        .iter()
+        .any(|chain| (chain.flags & 1) != 0)
+    {
         required_minor = required_minor.max(3);
     }
     for path in &args.include_descriptors_from_images {
         if let Ok(info) = inspect_avb_image(path) {
             required_minor = required_minor.max(info.header.required_libavb_version_minor);
         }
+    }
+    if is_mldsa_algorithm(&args.algorithm_name) {
+        required_minor = required_minor.max(4);
+    }
+    required_minor
+}
+
+fn required_libavb_minor_for_update(args: &VbmetaImageArgs, partition_minor: u32) -> u32 {
+    // Match upstream update_partition_descriptor: start from a fresh tmp_header
+    // (minor 0) and only bump from args/include/partition metadata.
+    let mut required_minor = 0u32;
+    if args.rollback_index_location > 0 {
+        required_minor = required_minor.max(2);
+    }
+    if args
+        .chain_partitions
+        .iter()
+        .any(|chain| (chain.flags & 1) != 0)
+    {
+        required_minor = required_minor.max(3);
+    }
+    required_minor = required_minor.max(partition_minor);
+    for path in &args.include_descriptors_from_images {
+        if let Ok(info) = inspect_avb_image(path) {
+            required_minor = required_minor.max(info.header.required_libavb_version_minor);
+        }
+    }
+    if is_mldsa_algorithm(&args.algorithm_name) {
+        required_minor = required_minor.max(4);
     }
     required_minor
 }
@@ -714,15 +1020,17 @@ pub fn required_libavb_minor_for_args(args: &VbmetaImageArgs) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::{SignOptions, extract_public_key, load_mldsa_key_from_spec};
+    use crate::verify::{VerifyImageOptions, verify_image};
+    use std::sync::Mutex;
     use tempfile::tempdir;
 
-    #[test]
-    fn make_vbmeta_image_writes_signed_blob() {
-        let temp = tempdir().unwrap();
-        let output = temp.path().join("vbmeta.img");
-        let args = VbmetaImageArgs {
-            algorithm_name: "SHA256_RSA2048".to_string(),
-            key_spec: Some("testkey_rsa2048".to_string()),
+    static HELPER_LOCK: Mutex<()> = Mutex::new(());
+
+    fn sample_args(algorithm_name: &str, key_spec: Option<&str>) -> VbmetaImageArgs {
+        VbmetaImageArgs {
+            algorithm_name: algorithm_name.to_string(),
+            key_spec: key_spec.map(str::to_string),
             public_key_metadata: None,
             rollback_index: 7,
             flags: 0,
@@ -738,11 +1046,299 @@ mod tests {
             release_string: Some("avbtool-rs test".to_string()),
             append_to_release_string: None,
             padding_size: 0,
-        };
+        }
+    }
 
+    fn hash_descriptor(partition_name: &str, digest: &[u8]) -> DescriptorInfo {
+        DescriptorInfo::Hash {
+            image_size: 4096,
+            hash_algorithm: "sha256".to_string(),
+            partition_name: partition_name.to_string(),
+            salt: vec![0x11, 0x22],
+            digest: digest.to_vec(),
+            flags: 0,
+        }
+    }
+
+    #[test]
+    fn make_vbmeta_image_writes_signed_blob() {
+        let temp = tempdir().unwrap();
+        let output = temp.path().join("vbmeta.img");
+        let args = sample_args("SHA256_RSA2048", Some("testkey_rsa2048"));
         make_vbmeta_image(&output, &args).unwrap();
         let info = inspect_avb_image(&output).unwrap();
         assert_eq!(info.header.algorithm_type, 1);
         assert_eq!(info.header.rollback_index, 7);
+        assert_eq!(info.header.hash_size, 32);
+        assert_eq!(info.header.required_libavb_version_minor, 0);
+    }
+
+    #[test]
+    fn mldsa_build_inspect_verify_and_required_minor_4() {
+        for (spec, alg, alg_type, sig_len, pk_len) in [
+            ("testkey_mldsa65", "MLDSA65", 7u32, 3309usize, 4 + 1952usize),
+            ("testkey_mldsa87", "MLDSA87", 8u32, 4627usize, 4 + 2592usize),
+        ] {
+            let temp = tempdir().unwrap();
+            let output = temp.path().join(format!("{alg}.img"));
+            let args = sample_args(alg, Some(spec));
+            assert_eq!(required_libavb_minor_for_args(&args), 4);
+            make_vbmeta_image(&output, &args).unwrap();
+
+            let info = inspect_avb_image(&output).unwrap();
+            assert_eq!(info.header.algorithm_type, alg_type);
+            assert_eq!(info.header.hash_size, 0);
+            assert_eq!(info.header.signature_size, sig_len as u64);
+            assert_eq!(info.header.public_key_size, pk_len as u64);
+            assert_eq!(info.header.required_libavb_version_minor, 4);
+            assert_eq!(info.algorithm_name, alg);
+
+            let report = verify_image(
+                &output,
+                &VerifyImageOptions {
+                    key_blob: Some(extract_public_key(spec).unwrap()),
+                    expected_chain_partitions: Vec::new(),
+                    follow_chain_partitions: false,
+                    accept_zeroed_hashtree: false,
+                },
+            )
+            .unwrap();
+            assert!(
+                report
+                    .messages
+                    .iter()
+                    .any(|line| line.contains("Successfully verified"))
+            );
+        }
+    }
+
+    #[test]
+    fn mldsa_verify_detects_tamper_and_wrong_key() {
+        let temp = tempdir().unwrap();
+        let output = temp.path().join("mldsa65.img");
+        make_vbmeta_image(&output, &sample_args("MLDSA65", Some("testkey_mldsa65"))).unwrap();
+
+        let mut bytes = fs::read(&output).unwrap();
+        let flip = 256 + 8;
+        bytes[flip] ^= 0xff;
+        fs::write(&output, &bytes).unwrap();
+        let tamper_err = verify_image(
+            &output,
+            &VerifyImageOptions {
+                key_blob: None,
+                expected_chain_partitions: Vec::new(),
+                follow_chain_partitions: false,
+                accept_zeroed_hashtree: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            tamper_err.to_string().contains("Signature")
+                || tamper_err.to_string().contains("digest")
+                || tamper_err.to_string().contains("VBMeta"),
+            "{tamper_err}"
+        );
+
+        make_vbmeta_image(&output, &sample_args("MLDSA65", Some("testkey_mldsa65"))).unwrap();
+        let wrong = extract_public_key("testkey_mldsa87").unwrap();
+        let wrong_err = verify_image(
+            &output,
+            &VerifyImageOptions {
+                key_blob: Some(wrong),
+                expected_chain_partitions: Vec::new(),
+                follow_chain_partitions: false,
+                accept_zeroed_hashtree: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            wrong_err
+                .to_string()
+                .contains("Embedded public key does not match")
+                || wrong_err.to_string().contains("Signature"),
+            "{wrong_err}"
+        );
+    }
+
+    #[test]
+    fn rsa_regression_still_verifies() {
+        let temp = tempdir().unwrap();
+        let output = temp.path().join("rsa.img");
+        make_vbmeta_image(
+            &output,
+            &sample_args("SHA256_RSA2048", Some("testkey_rsa2048")),
+        )
+        .unwrap();
+        verify_image(
+            &output,
+            &VerifyImageOptions {
+                key_blob: Some(extract_public_key("testkey_rsa2048").unwrap()),
+                expected_chain_partitions: Vec::new(),
+                follow_chain_partitions: false,
+                accept_zeroed_hashtree: false,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn update_partition_descriptor_replaces_matching_hash() {
+        let temp = tempdir().unwrap();
+        let vbmeta_path = temp.path().join("vbmeta.img");
+        let part_new = temp.path().join("boot_new.img");
+
+        let mut old_args = sample_args("SHA256_RSA2048", Some("testkey_rsa2048"));
+        old_args.extra_descriptors = vec![
+            hash_descriptor("boot", &[0xAA; 32]),
+            hash_descriptor("vendor", &[0xBB; 32]),
+            DescriptorInfo::Property {
+                key: "keep.me".to_string(),
+                value: b"yes".to_vec(),
+            },
+        ];
+        make_vbmeta_image(&vbmeta_path, &old_args).unwrap();
+
+        let mut part_args = sample_args("NONE", None);
+        part_args.extra_descriptors = vec![hash_descriptor("boot", &[0xCC; 32])];
+        part_args.properties = vec![PropertySpec {
+            key: "part.only".to_string(),
+            value: b"x".to_vec(),
+        }];
+        make_vbmeta_image(&part_new, &part_args).unwrap();
+
+        let update_args = VbmetaImageArgs {
+            algorithm_name: "SHA256_RSA2048".to_string(),
+            key_spec: Some("testkey_rsa2048".to_string()),
+            public_key_metadata: None,
+            rollback_index: 9,
+            flags: 0,
+            rollback_index_location: 0,
+            properties: Vec::new(),
+            kernel_cmdlines: Vec::new(),
+            extra_descriptors: Vec::new(),
+            include_descriptors_from_images: Vec::new(),
+            chain_partitions: Vec::new(),
+            release_string: None,
+            append_to_release_string: None,
+            padding_size: 0,
+        };
+        let result = update_partition_descriptor(&vbmeta_path, &part_new, &update_args).unwrap();
+        fs::write(&vbmeta_path, &result.blob).unwrap();
+
+        let info = inspect_avb_image(&vbmeta_path).unwrap();
+        assert_eq!(info.header.rollback_index, 9);
+        let boot = info
+            .descriptors
+            .iter()
+            .find_map(|d| match d {
+                DescriptorInfo::Hash {
+                    partition_name,
+                    digest,
+                    ..
+                } if partition_name == "boot" => Some(digest.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(boot, vec![0xCC; 32]);
+        let vendor = info
+            .descriptors
+            .iter()
+            .find_map(|d| match d {
+                DescriptorInfo::Hash {
+                    partition_name,
+                    digest,
+                    ..
+                } if partition_name == "vendor" => Some(digest.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(vendor, vec![0xBB; 32]);
+        assert!(info.descriptors.iter().any(|d| matches!(
+            d,
+            DescriptorInfo::Property { key, .. } if key == "keep.me"
+        )));
+    }
+
+    #[test]
+    fn update_partition_descriptor_reports_required_minor_for_mldsa() {
+        let temp = tempdir().unwrap();
+        let vbmeta_path = temp.path().join("vbmeta.img");
+        let part_path = temp.path().join("boot.img");
+
+        let mut old_args = sample_args("SHA256_RSA2048", Some("testkey_rsa2048"));
+        old_args.extra_descriptors = vec![hash_descriptor("boot", &[0x11; 32])];
+        make_vbmeta_image(&vbmeta_path, &old_args).unwrap();
+
+        let mut part_args = sample_args("NONE", None);
+        part_args.extra_descriptors = vec![hash_descriptor("boot", &[0x22; 32])];
+        make_vbmeta_image(&part_path, &part_args).unwrap();
+
+        let update_args = sample_args("MLDSA65", Some("testkey_mldsa65"));
+        let result = update_partition_descriptor(&vbmeta_path, &part_path, &update_args).unwrap();
+        assert_eq!(result.required_libavb_version_minor, 4);
+        fs::write(&vbmeta_path, &result.blob).unwrap();
+        let info = inspect_avb_image(&vbmeta_path).unwrap();
+        assert_eq!(info.header.required_libavb_version_minor, 4);
+        assert_eq!(info.header.algorithm_type, 7);
+    }
+
+    #[test]
+    fn builder_signing_helper_requires_key_path() {
+        let _guard = HELPER_LOCK.lock().unwrap();
+        let helper = write_helper_script(
+            "builder_rsa_helper",
+            r#"
+import sys
+sys.stdout.buffer.write(b"X" * 256)
+"#,
+        );
+        let temp = tempdir().unwrap();
+        let output = temp.path().join("helper.img");
+        let args = sample_args("SHA256_RSA2048", Some("testkey_rsa2048"));
+        make_vbmeta_image_with_options(&output, &args, &BuildSignOptions::default()).unwrap();
+        assert!(output.exists());
+
+        let options = BuildSignOptions {
+            sign: SignOptions {
+                signing_helper: Some(helper),
+                signing_helper_with_files: None,
+                key_path: None,
+            },
+        };
+        let err = make_vbmeta_image_with_options(&output, &args, &options)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("signing helper requires key_path"), "{err}");
+    }
+
+    #[test]
+    fn none_algorithm_builds_without_key() {
+        let temp = tempdir().unwrap();
+        let output = temp.path().join("none.img");
+        make_vbmeta_image(&output, &sample_args("NONE", None)).unwrap();
+        let info = inspect_avb_image(&output).unwrap();
+        assert_eq!(info.header.algorithm_type, 0);
+        assert_eq!(info.header.hash_size, 0);
+        assert_eq!(info.header.signature_size, 0);
+        assert_eq!(info.header.public_key_size, 0);
+    }
+
+    #[test]
+    fn mldsa_key_spec_loads_in_builder() {
+        let key = load_mldsa_key_from_spec("testkey_mldsa65").unwrap();
+        assert_eq!(key.algorithm_name(), "MLDSA65");
+        assert_eq!(key.encode_public_key().len(), 4 + 1952);
+    }
+
+    fn write_helper_script(name: &str, body: &str) -> PathBuf {
+        let script_path = std::env::temp_dir().join(format!("avbtool-rs-{name}.py"));
+        fs::write(&script_path, format!("#!/usr/bin/env python3\n{body}")).unwrap();
+        let launcher = std::env::temp_dir().join(format!("avbtool-rs-{name}.cmd"));
+        fs::write(
+            &launcher,
+            format!("@echo off\npython \"{}\" %*\n", script_path.display()),
+        )
+        .unwrap();
+        launcher
     }
 }

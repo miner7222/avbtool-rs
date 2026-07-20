@@ -1,7 +1,7 @@
 //! Reed-Solomon FEC encoder for AVB-style hashtree FEC regions.
 //!
 //! AVB's FEC matches the configuration `init_rs_char(8, 0x11d, 0, 1, nroots, 0)`
-//! used by AOSP's `system/extras/libfec`:
+//! used by AOSP's `system/extras/libfec` / `verity/fec`:
 //!
 //!   * `symsize = 8`     — bytes are GF(2^8) symbols
 //!   * `gfpoly  = 0x11d` — primitive polynomial x^8 + x^4 + x^3 + x^2 + 1
@@ -9,24 +9,37 @@
 //!   * `prim    = 1`     — primitive element step
 //!   * `nroots  = 2`     — typical AVB choice; corrects 1 byte / RS codeword
 //!
-//! Encoding is systematic. Each "round" consumes `255 - nroots` data bytes
-//! (zero-padded for the final round) and produces `nroots` parity bytes.
-//! AVB writes only the parity stream out, concatenating all rounds; the
-//! data is consulted again during recovery from disk. The total parity
-//! byte count is rounded up to the next multiple of `FEC_BLOCKSIZE`
-//! (`4096`) by zero-padding the tail.
+//! Encoding is systematic and **block-interleaved**, matching AOSP
+//! `image_get_interleaved_byte` / `fec_ecc_interleave`:
+//!
+//!   * `rsn = 255 - nroots`
+//!   * `blocks = ceil(input_size / 4096)`
+//!   * `rounds = ceil(blocks / rsn)`
+//!   * actual FEC data size = `rounds * nroots * 4096`
+//!
+//! Codeword `k` (0 .. rounds*4096) consumes `rsn` data symbols taken from
+//! physical offsets `k + j * rounds * 4096` for `j = 0 .. rsn-1` (zero when
+//! beyond the input), then appends `nroots` parity bytes. AVB stores only the
+//! parity stream; the covered data lives again on disk for recovery.
 //!
 //! The FEC input is the data area of the partition concatenated with the
 //! dm-verity hash tree, in that order. Use [`generate_fec_bytes`] when you
 //! already hold the input in memory, or [`generate_fec_from_image`] to
 //! stream it from a file (for multi-GB partitions where holding the full
 //! buffer is wasteful).
+//!
+//! Size helpers:
+//!   * [`fec_size_for_input`] — actual parity bytes written into the image /
+//!     hashtree descriptor (`image_ecc_new`).
+//!   * [`calc_fec_data_size`] — AOSP `fec --print-fec-size` / avbtool
+//!     `calc_fec_data_size` reserve: actual size plus one 4096-byte FEC tool
+//!     footer. Used only for conservative `calc_max` budgeting.
 
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::{AvbToolError as DynoError, Result};
+use crate::parser::sparse_err;
+use crate::sparse::ImageHandler;
 
 /// Size each FEC region is rounded up to (matches AOSP `FEC_BLOCKSIZE`).
 pub const FEC_BLOCKSIZE: u64 = 4096;
@@ -73,14 +86,14 @@ impl ReedSolomonEncoder {
         })
     }
 
-    /// Number of data bytes consumed per round (`255 - nroots`).
+    /// Number of data bytes consumed per codeword (`255 - nroots`).
     pub fn data_bytes_per_round(&self) -> usize {
         (NN as usize) - self.nroots
     }
 
-    /// Produce `nroots` parity bytes for one round. `data` must have at
+    /// Produce `nroots` parity bytes for one RS codeword. `data` must have at
     /// most `data_bytes_per_round()` bytes; missing tail bytes are treated
-    /// as zero, matching libfec's pad behavior on the final round.
+    /// as zero, matching libfec's pad behavior on shortened symbols.
     pub fn encode_round(&self, data: &[u8], parity_out: &mut [u8]) -> Result<()> {
         let rsn = self.data_bytes_per_round();
         if data.len() > rsn {
@@ -99,7 +112,7 @@ impl ReedSolomonEncoder {
         }
 
         // Feed `rsn` bytes; pad the trailing region with zeros to mirror
-        // libfec's pad-with-zero behavior on the final round.
+        // libfec's pad-with-zero behavior on shortened symbols.
         let mut parity = vec![0u8; self.nroots];
         for i in 0..rsn {
             let symbol = if i < data.len() { data[i] } else { 0u8 };
@@ -109,10 +122,10 @@ impl ReedSolomonEncoder {
             if feedback != A0 {
                 // parity[j] ^= alpha_to[(feedback + genpoly_log[nroots - j]) mod 255]
                 // for j in 1..nroots
-                for j in 1..self.nroots {
+                for (j, parity_byte) in parity.iter_mut().enumerate().skip(1) {
                     let g_log = self.genpoly_log[self.nroots - j] as usize;
                     let idx = mod_nn(feedback + g_log);
-                    parity[j] ^= self.alpha_to[idx];
+                    *parity_byte ^= self.alpha_to[idx];
                 }
             }
 
@@ -142,8 +155,8 @@ fn build_gf_tables() -> ([u8; 256], [u8; 256]) {
 
     // Generate alpha_to[i] = α^i, starting from α^0 = 1.
     let mut sr: u32 = 1;
-    for i in 0..(NN as usize) {
-        alpha_to[i] = sr as u8;
+    for alpha in alpha_to.iter_mut().take(NN as usize) {
+        *alpha = sr as u8;
         // Multiply by α (= 2 in GF(2^8)) and reduce mod GF_POLY when degree ≥ 8.
         sr <<= 1;
         if sr & 0x100 != 0 {
@@ -155,8 +168,8 @@ fn build_gf_tables() -> ([u8; 256], [u8; 256]) {
     alpha_to[NN as usize] = 0;
 
     // Build inverse table: index_of[α^i] = i.
-    for i in 0..256 {
-        index_of[i] = A0 as u8; // 0 → A0 sentinel
+    for slot in index_of.iter_mut() {
+        *slot = A0 as u8; // 0 → A0 sentinel
     }
     for i in 0..(NN as usize) {
         index_of[alpha_to[i] as usize] = i as u8;
@@ -205,110 +218,246 @@ fn mod_nn(x: usize) -> usize {
     x % (NN as usize)
 }
 
-/// Compute the AVB FEC region size for a given combined input length.
+/// Number of 4096-byte source blocks covered by FEC.
+#[inline]
+fn fec_blocks(input_size: u64) -> u64 {
+    input_size.div_ceil(FEC_BLOCKSIZE)
+}
+
+/// Number of RS interleave rounds for an input of `input_size` bytes.
+#[inline]
+fn fec_rounds(input_size: u64, nroots: u32) -> u64 {
+    let rsn = (NN as u64) - u64::from(nroots);
+    fec_blocks(input_size).div_ceil(rsn)
+}
+
+/// Actual AVB FEC data size for a given combined input length.
+///
 /// `input_size` is the number of bytes covered by FEC (typically the
 /// partition's aligned data area concatenated with the dm-verity hash
-/// tree). Result is rounded up to [`FEC_BLOCKSIZE`].
+/// tree). Result equals AOSP `image_ecc_new`: `rounds * nroots * 4096`.
+///
+/// This is the size written into the hashtree descriptor and appended to
+/// the image. It does **not** include the external `fec` tool footer.
 pub fn fec_size_for_input(input_size: u64, nroots: u32) -> u64 {
-    let rsn = (NN as u64) - nroots as u64;
-    let rounds = input_size.div_ceil(rsn);
-    let bytes = rounds * nroots as u64;
-    round_up_to_block(bytes)
+    fec_rounds(input_size, nroots) * u64::from(nroots) * FEC_BLOCKSIZE
 }
 
-fn round_up_to_block(value: u64) -> u64 {
-    (value + FEC_BLOCKSIZE - 1) & !(FEC_BLOCKSIZE - 1)
+/// Size returned by AOSP `fec --print-fec-size` / avbtool `calc_fec_data_size`.
+///
+/// Equals [`fec_size_for_input`] plus one 4096-byte FEC tool footer
+/// (`fec_ecc_get_size`). Use this only for conservative partition budgeting
+/// (`calc_max`); the descriptor and on-image FEC region use the actual size.
+pub fn calc_fec_data_size(input_size: u64, nroots: u32) -> u64 {
+    fec_size_for_input(input_size, nroots) + FEC_BLOCKSIZE
 }
 
-/// Encode FEC over an in-memory input buffer.
+/// AOSP `fec` encoder requires a non-empty, 4096-byte-aligned input.
+fn validate_fec_input_size(input_size: u64) -> Result<()> {
+    if input_size == 0 {
+        return Err(DynoError::Validation(
+            "FEC input is empty; AOSP fec rejects empty files".into(),
+        ));
+    }
+    if !input_size.is_multiple_of(FEC_BLOCKSIZE) {
+        return Err(DynoError::Validation(format!(
+            "FEC input size {} is not a multiple of {} bytes",
+            input_size, FEC_BLOCKSIZE
+        )));
+    }
+    Ok(())
+}
+
+/// Encode FEC over an in-memory input buffer using AOSP block interleaving.
 ///
 /// Returns a buffer of length `fec_size_for_input(input.len(), nroots)`
-/// containing the parity stream followed by zero padding.
+/// containing only the parity stream (no tool footer).
+///
+/// # Errors
+///
+/// Returns an error when `nroots` is out of range, the input is empty, or
+/// the input length is not a multiple of [`FEC_BLOCKSIZE`].
 pub fn generate_fec_bytes(input: &[u8], nroots: u32) -> Result<Vec<u8>> {
-    let nroots = nroots as usize;
-    let encoder = ReedSolomonEncoder::new_avb(nroots)?;
+    let input_size = input.len() as u64;
+    validate_fec_input_size(input_size)?;
+    let nroots_usize = nroots as usize;
+    let encoder = ReedSolomonEncoder::new_avb(nroots_usize)?;
     let rsn = encoder.data_bytes_per_round();
-    let total_size = fec_size_for_input(input.len() as u64, nroots as u32) as usize;
-    let mut out = Vec::with_capacity(total_size);
+    let rounds = fec_rounds(input_size, nroots);
+    let blocks = fec_blocks(input_size);
+    let total_size = fec_size_for_input(input_size, nroots) as usize;
 
-    let mut offset = 0usize;
-    let mut parity_buf = vec![0u8; nroots];
-    while offset < input.len() {
-        let end = (offset + rsn).min(input.len());
-        let chunk = &input[offset..end];
-        encoder.encode_round(chunk, &mut parity_buf)?;
-        out.extend_from_slice(&parity_buf);
-        offset += rsn;
+    let mut out = vec![0u8; total_size];
+    let mut parity_buf = vec![0u8; nroots_usize];
+    let mut data = vec![0u8; rsn];
+    // One interleave round: up to `rsn` source blocks (~1 MiB for roots=2).
+    let mut source_blocks = vec![0u8; rsn * FEC_BLOCKSIZE as usize];
+    let mut out_pos = 0usize;
+
+    for round_idx in 0..rounds {
+        source_blocks.fill(0);
+        for j in 0..rsn {
+            let block_idx = round_idx + (j as u64) * rounds;
+            if block_idx < blocks {
+                let start = (block_idx * FEC_BLOCKSIZE) as usize;
+                let end = start + FEC_BLOCKSIZE as usize;
+                let dst = j * FEC_BLOCKSIZE as usize;
+                source_blocks[dst..dst + FEC_BLOCKSIZE as usize]
+                    .copy_from_slice(&input[start..end]);
+            }
+        }
+
+        for byte_in_block in 0..FEC_BLOCKSIZE as usize {
+            for j in 0..rsn {
+                data[j] = source_blocks[j * FEC_BLOCKSIZE as usize + byte_in_block];
+            }
+            encoder.encode_round(&data, &mut parity_buf)?;
+            out[out_pos..out_pos + nroots_usize].copy_from_slice(&parity_buf);
+            out_pos += nroots_usize;
+        }
     }
-    // Zero-pad up to FEC_BLOCKSIZE multiple.
-    out.resize(total_size, 0);
+
+    debug_assert_eq!(out_pos, total_size);
     Ok(out)
 }
 
-/// Encode FEC over the first `input_size` bytes of an image file. The
-/// stream is read in `rsn`-sized chunks from the supplied path; the
-/// returned buffer matches the layout of AVB's `fec` region.
+/// Encode FEC over the first `input_size` bytes of an image file using AOSP
+/// block interleaving. Source blocks are read whole (no per-byte seeks).
+///
+/// # Errors
+///
+/// Returns an error when `nroots` is out of range, the input is empty/non-
+/// aligned, or the image cannot supply `input_size` bytes.
 pub fn generate_fec_from_image(
     image_filename: &Path,
     input_size: u64,
     nroots: u32,
 ) -> Result<Vec<u8>> {
-    let nroots = nroots as usize;
-    let encoder = ReedSolomonEncoder::new_avb(nroots)?;
+    validate_fec_input_size(input_size)?;
+    let nroots_usize = nroots as usize;
+    let encoder = ReedSolomonEncoder::new_avb(nroots_usize)?;
     let rsn = encoder.data_bytes_per_round();
-    let total_size = fec_size_for_input(input_size, nroots as u32) as usize;
-    let mut out = Vec::with_capacity(total_size);
+    let rounds = fec_rounds(input_size, nroots);
+    let blocks = fec_blocks(input_size);
+    let total_size = fec_size_for_input(input_size, nroots) as usize;
 
-    let mut file = File::open(image_filename)?;
-    file.seek(SeekFrom::Start(0))?;
-    let mut data_buf = vec![0u8; rsn];
-    let mut parity_buf = vec![0u8; nroots];
-    let mut remaining = input_size;
-    while remaining > 0 {
-        let to_read = remaining.min(rsn as u64) as usize;
-        let buf = &mut data_buf[..to_read];
-        file.read_exact(buf)?;
-        encoder.encode_round(buf, &mut parity_buf)?;
-        out.extend_from_slice(&parity_buf);
-        remaining -= to_read as u64;
+    let mut image = ImageHandler::open(image_filename, true).map_err(sparse_err)?;
+    let mut out = vec![0u8; total_size];
+    let mut parity_buf = vec![0u8; nroots_usize];
+    let mut data = vec![0u8; rsn];
+    let mut source_blocks = vec![0u8; rsn * FEC_BLOCKSIZE as usize];
+    let mut out_pos = 0usize;
+
+    for round_idx in 0..rounds {
+        source_blocks.fill(0);
+        for j in 0..rsn {
+            let block_idx = round_idx + (j as u64) * rounds;
+            if block_idx < blocks {
+                let offset = block_idx * FEC_BLOCKSIZE;
+                image.seek(offset).map_err(sparse_err)?;
+                let buf = image.read(FEC_BLOCKSIZE as usize).map_err(sparse_err)?;
+                if buf.len() != FEC_BLOCKSIZE as usize {
+                    return Err(DynoError::Tool(
+                        "Unexpected EOF while generating FEC from image".into(),
+                    ));
+                }
+                let dst = j * FEC_BLOCKSIZE as usize;
+                source_blocks[dst..dst + FEC_BLOCKSIZE as usize].copy_from_slice(&buf);
+            }
+        }
+
+        for byte_in_block in 0..FEC_BLOCKSIZE as usize {
+            for j in 0..rsn {
+                data[j] = source_blocks[j * FEC_BLOCKSIZE as usize + byte_in_block];
+            }
+            encoder.encode_round(&data, &mut parity_buf)?;
+            out[out_pos..out_pos + nroots_usize].copy_from_slice(&parity_buf);
+            out_pos += nroots_usize;
+        }
     }
-    out.resize(total_size, 0);
+
+    debug_assert_eq!(out_pos, total_size);
+    Ok(out)
+}
+
+/// Reference (naive) AOSP interleave encoder used by tests.
+#[cfg(test)]
+fn generate_fec_bytes_naive(input: &[u8], nroots: u32) -> Result<Vec<u8>> {
+    let input_size = input.len() as u64;
+    validate_fec_input_size(input_size)?;
+    let encoder = ReedSolomonEncoder::new_avb(nroots as usize)?;
+    let rsn = encoder.data_bytes_per_round();
+    let rounds = fec_rounds(input_size, nroots);
+    let codewords = rounds * FEC_BLOCKSIZE;
+    let mut out = Vec::with_capacity((codewords * u64::from(nroots)) as usize);
+    let mut data = vec![0u8; rsn];
+    let mut parity = vec![0u8; nroots as usize];
+    for k in 0..codewords {
+        for (j, symbol) in data.iter_mut().enumerate() {
+            let offset = k + (j as u64) * rounds * FEC_BLOCKSIZE;
+            *symbol = if offset < input_size {
+                input[offset as usize]
+            } else {
+                0
+            };
+        }
+        encoder.encode_round(&data, &mut parity)?;
+        out.extend_from_slice(&parity);
+    }
     Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn fec_size_matches_libfec_formula_for_avb_vendor_typical_case() {
         // Real Lenovo Y700 Gen 4 vendor.img: image_size + tree_size with
-        // nroots = 2. Should round up to the descriptor's recorded value.
+        // nroots = 2. Actual FEC data (no tool footer).
         let input_size = 1_511_202_816 + 11_907_072;
         assert_eq!(fec_size_for_input(input_size, 2), 12_042_240);
+        assert_eq!(
+            calc_fec_data_size(input_size, 2),
+            12_042_240 + FEC_BLOCKSIZE
+        );
     }
 
     #[test]
     fn fec_size_block_aligns() {
         for &nroots in &[1u32, 2, 3, 4] {
-            for &size in &[0u64, 1, 4096, 4097, 1_000_000] {
+            for &size in &[0u64, 1, 4096, 4097, 1_000_000, 1024 * 1024] {
                 let s = fec_size_for_input(size, nroots);
-                assert!(s % FEC_BLOCKSIZE == 0, "size {s} not 4096-aligned");
+                assert!(
+                    s.is_multiple_of(FEC_BLOCKSIZE),
+                    "size {s} not 4096-aligned for input {size} roots {nroots}"
+                );
+                assert_eq!(calc_fec_data_size(size, nroots), s + FEC_BLOCKSIZE);
             }
         }
     }
 
     #[test]
-    fn fec_short_input_round_trip() {
-        // Encode a short string with nroots=2; verify length matches the
-        // formula and parity bytes are deterministic.
-        let input = b"Hello, AVB FEC test. Quick brown fox jumps over lazy dog.".to_vec();
+    fn fec_size_one_mib_actual_roots_two_and_four() {
+        let input_size = 1024 * 1024;
+        // blocks=256; roots2 rsn=253 rounds=2 => 2*2*4096=16384
+        // roots4 rsn=251 rounds=2 => 2*4*4096=32768
+        assert_eq!(fec_size_for_input(input_size, 2), 16_384);
+        assert_eq!(fec_size_for_input(input_size, 4), 32_768);
+        assert_eq!(calc_fec_data_size(input_size, 2), 16_384 + FEC_BLOCKSIZE);
+        assert_eq!(calc_fec_data_size(input_size, 4), 32_768 + FEC_BLOCKSIZE);
+    }
+
+    #[test]
+    fn fec_aligned_input_is_deterministic() {
+        let input = vec![0x5au8; 8192];
         let parity = generate_fec_bytes(&input, 2).unwrap();
         assert_eq!(
             parity.len(),
             fec_size_for_input(input.len() as u64, 2) as usize
         );
-        // Two encodings of the same input must agree byte-for-byte.
         let parity2 = generate_fec_bytes(&input, 2).unwrap();
         assert_eq!(parity, parity2);
     }
@@ -319,5 +468,92 @@ mod tests {
         let mut parity = [0xffu8; 2];
         encoder.encode_round(&[0u8; 253], &mut parity).unwrap();
         assert_eq!(parity, [0u8, 0u8]);
+    }
+
+    #[test]
+    fn generate_fec_rejects_empty_and_non_aligned() {
+        let err = generate_fec_bytes(&[], 2).unwrap_err();
+        assert!(err.to_string().contains("empty"));
+
+        let err = generate_fec_bytes(&[1u8; 100], 2).unwrap_err();
+        assert!(err.to_string().contains("multiple of"));
+    }
+
+    #[test]
+    fn interleave_matches_manual_rs_for_two_rounds() {
+        // roots=2, rsn=253: 254 blocks => rounds=2. Pattern tags every block.
+        let blocks = 254u64;
+        let mut input = vec![0u8; (blocks * FEC_BLOCKSIZE) as usize];
+        for block_idx in 0..blocks {
+            let start = (block_idx * FEC_BLOCKSIZE) as usize;
+            let end = start + FEC_BLOCKSIZE as usize;
+            let tag = (block_idx as u8).wrapping_mul(17).wrapping_add(3);
+            input[start..end].fill(tag);
+            // Distinct first bytes so codewords are not all identical.
+            input[start] = block_idx as u8;
+            if end - start > 1 {
+                input[start + 1] = (block_idx >> 8) as u8;
+            }
+        }
+
+        let actual = generate_fec_bytes(&input, 2).unwrap();
+        let expected = generate_fec_bytes_naive(&input, 2).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 16_384);
+
+        // Spot-check both rounds via ReedSolomonEncoder directly.
+        let encoder = ReedSolomonEncoder::new_avb(2).unwrap();
+        let rsn = encoder.data_bytes_per_round();
+        let rounds = 2u64;
+        for &(round_idx, byte_in_block) in &[(0u64, 0usize), (0, 1), (1, 0), (1, 4095)] {
+            let k = round_idx * FEC_BLOCKSIZE + byte_in_block as u64;
+            let mut data = vec![0u8; rsn];
+            for (j, symbol) in data.iter_mut().enumerate() {
+                let offset = k + (j as u64) * rounds * FEC_BLOCKSIZE;
+                if offset < input.len() as u64 {
+                    *symbol = input[offset as usize];
+                }
+            }
+            let mut parity = [0u8; 2];
+            encoder.encode_round(&data, &mut parity).unwrap();
+            let out_off = (k as usize) * 2;
+            assert_eq!(&actual[out_off..out_off + 2], &parity);
+        }
+    }
+
+    #[test]
+    fn in_memory_and_file_backed_fec_match() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("fec_src.bin");
+        // 3 blocks: roots=2 => rounds=1.
+        let mut input = vec![0u8; 3 * FEC_BLOCKSIZE as usize];
+        for (i, b) in input.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        fs::write(&path, &input).unwrap();
+
+        let mem = generate_fec_bytes(&input, 2).unwrap();
+        let file = generate_fec_from_image(&path, input.len() as u64, 2).unwrap();
+        assert_eq!(mem, file);
+        assert_eq!(mem.len() as u64, fec_size_for_input(input.len() as u64, 2));
+    }
+
+    #[test]
+    fn file_backed_rejects_non_aligned() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("odd.bin");
+        fs::write(&path, vec![0u8; 100]).unwrap();
+        let err = generate_fec_from_image(&path, 100, 2).unwrap_err();
+        assert!(err.to_string().contains("multiple of"));
+    }
+
+    #[test]
+    fn roots_two_and_four_produce_distinct_parity() {
+        let input = vec![0x5au8; 8192];
+        let p2 = generate_fec_bytes(&input, 2).unwrap();
+        let p4 = generate_fec_bytes(&input, 4).unwrap();
+        assert_eq!(p2.len() as u64, fec_size_for_input(input.len() as u64, 2));
+        assert_eq!(p4.len() as u64, fec_size_for_input(input.len() as u64, 4));
+        assert_ne!(p2, p4[..p2.len()]);
     }
 }

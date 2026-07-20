@@ -34,10 +34,7 @@ pub fn calculate_vbmeta_digest(image_filename: &Path, hash_algorithm: &str) -> R
     }
 }
 
-pub fn calculate_kernel_cmdline(
-    image_filename: &Path,
-    hashtree_disabled: bool,
-) -> Result<String> {
+pub fn calculate_kernel_cmdline(image_filename: &Path, hashtree_disabled: bool) -> Result<String> {
     let mut snippets = Vec::new();
     collect_kernel_cmdlines_recursive(image_filename, &mut snippets)?;
     let filtered = snippets
@@ -71,10 +68,7 @@ fn collect_vbmeta_blobs_recursive(path: &Path, blobs: &mut Vec<Vec<u8>>) -> Resu
     Ok(())
 }
 
-fn collect_kernel_cmdlines_recursive(
-    path: &Path,
-    snippets: &mut Vec<(u32, String)>,
-) -> Result<()> {
+fn collect_kernel_cmdlines_recursive(path: &Path, snippets: &mut Vec<(u32, String)>) -> Result<()> {
     let info = inspect_avb_image(path)?;
     for descriptor in info.descriptors {
         match descriptor {
@@ -83,7 +77,10 @@ fn collect_kernel_cmdlines_recursive(
                 kernel_cmdline,
             } => snippets.push((flags, kernel_cmdline)),
             DescriptorInfo::ChainPartition { partition_name, .. } => {
-                collect_kernel_cmdlines_recursive(&chained_image_path(path, &partition_name), snippets)?;
+                collect_kernel_cmdlines_recursive(
+                    &chained_image_path(path, &partition_name),
+                    snippets,
+                )?;
             }
             _ => {}
         }
@@ -109,7 +106,10 @@ fn collect_partition_digests_recursive(
                 ..
             } => entries.push((partition_name, bytes_to_hex(&root_digest))),
             DescriptorInfo::ChainPartition { partition_name, .. } => {
-                collect_partition_digests_recursive(&chained_image_path(path, &partition_name), entries)?;
+                collect_partition_digests_recursive(
+                    &chained_image_path(path, &partition_name),
+                    entries,
+                )?;
             }
             _ => {}
         }

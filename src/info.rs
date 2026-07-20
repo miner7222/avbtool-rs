@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
-use std::fs::{self, File};
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::fs;
+use std::io::{Cursor, Read};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -11,11 +11,12 @@ use sha1::{Digest as Sha1Digest, Sha1};
 
 use crate::crypto::lookup_algorithm_by_type;
 use crate::error::{AvbToolError as DynoError, Result};
-
+use crate::image::read_exact_at;
 use crate::parser::{
     AVB_FOOTER_SIZE, AVB_VBMETA_IMAGE_HEADER_SIZE, AvbFooter, AvbImageType, AvbVBMetaHeader,
-    detect_avb_image_type,
+    detect_avb_image_type, sparse_err,
 };
+use crate::sparse::ImageHandler;
 
 const DESCRIPTOR_HEADER_SIZE: usize = 16;
 const PROPERTY_DESCRIPTOR_SIZE: usize = 32;
@@ -30,6 +31,20 @@ const DESCRIPTOR_TAG_HASH: u64 = 2;
 const DESCRIPTOR_TAG_KERNEL_CMDLINE: u64 = 3;
 const DESCRIPTOR_TAG_CHAIN_PARTITION: u64 = 4;
 
+/// Optional rendering hooks for sparse markers and cert integration.
+///
+/// These stay inert until callers supply sparse detection or preformatted cert
+/// text; they intentionally avoid importing unfinished modules.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InfoRenderOptions {
+    /// When true, appends ` (Sparse)` to the Minimum libavb version line.
+    pub sparse: bool,
+    /// When true and [`Self::cert_text`] is set, appends an avb_cert section.
+    pub include_cert: bool,
+    /// Optional preformatted certificate block.
+    pub cert_text: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanEntry {
     pub path: PathBuf,
@@ -37,7 +52,10 @@ pub struct ScanEntry {
     pub result: ScanResult,
 }
 
+// AvbImageInfo is large; boxing would force image.rs call-site changes outside
+// this packet. Keep the ergonomic variant and silence the size lint.
 #[derive(Debug, Clone, Serialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum ScanResult {
     Avb(AvbImageInfo),
     None,
@@ -105,10 +123,12 @@ pub enum DescriptorInfo {
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 fn serialize_descriptors<S: Serializer>(
@@ -125,7 +145,7 @@ fn serialize_descriptors<S: Serializer>(
 
 struct JsonDescriptor<'a>(&'a DescriptorInfo);
 
-impl<'a> Serialize for JsonDescriptor<'a> {
+impl Serialize for JsonDescriptor<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(1))?;
         match self.0 {
@@ -135,12 +155,22 @@ impl<'a> Serialize for JsonDescriptor<'a> {
                     key: &'b str,
                     value: String,
                 }
-                map.serialize_entry("Property", &V {
-                    key,
-                    value: String::from_utf8_lossy(value).into_owned(),
-                })?;
+                map.serialize_entry(
+                    "Property",
+                    &V {
+                        key,
+                        value: String::from_utf8_lossy(value).into_owned(),
+                    },
+                )?;
             }
-            DescriptorInfo::Hash { image_size, hash_algorithm, partition_name, salt, digest, flags } => {
+            DescriptorInfo::Hash {
+                image_size,
+                hash_algorithm,
+                partition_name,
+                salt,
+                digest,
+                flags,
+            } => {
                 #[derive(Serialize)]
                 struct V<'b> {
                     image_size: u64,
@@ -150,19 +180,33 @@ impl<'a> Serialize for JsonDescriptor<'a> {
                     digest: String,
                     flags: u32,
                 }
-                map.serialize_entry("Hash", &V {
-                    image_size: *image_size,
-                    hash_algorithm,
-                    partition_name,
-                    salt: bytes_to_hex(salt),
-                    digest: bytes_to_hex(digest),
-                    flags: *flags,
-                })?;
+                map.serialize_entry(
+                    "Hash",
+                    &V {
+                        image_size: *image_size,
+                        hash_algorithm,
+                        partition_name,
+                        salt: bytes_to_hex(salt),
+                        digest: bytes_to_hex(digest),
+                        flags: *flags,
+                    },
+                )?;
             }
             DescriptorInfo::Hashtree {
-                dm_verity_version, image_size, tree_offset, tree_size,
-                data_block_size, hash_block_size, fec_num_roots, fec_offset, fec_size,
-                hash_algorithm, partition_name, salt, root_digest, flags,
+                dm_verity_version,
+                image_size,
+                tree_offset,
+                tree_size,
+                data_block_size,
+                hash_block_size,
+                fec_num_roots,
+                fec_offset,
+                fec_size,
+                hash_algorithm,
+                partition_name,
+                salt,
+                root_digest,
+                flags,
             } => {
                 #[derive(Serialize)]
                 struct V<'b> {
@@ -181,35 +225,49 @@ impl<'a> Serialize for JsonDescriptor<'a> {
                     root_digest: String,
                     flags: u32,
                 }
-                map.serialize_entry("Hashtree", &V {
-                    dm_verity_version: *dm_verity_version,
-                    image_size: *image_size,
-                    tree_offset: *tree_offset,
-                    tree_size: *tree_size,
-                    data_block_size: *data_block_size,
-                    hash_block_size: *hash_block_size,
-                    fec_num_roots: *fec_num_roots,
-                    fec_offset: *fec_offset,
-                    fec_size: *fec_size,
-                    hash_algorithm,
-                    partition_name,
-                    salt: bytes_to_hex(salt),
-                    root_digest: bytes_to_hex(root_digest),
-                    flags: *flags,
-                })?;
+                map.serialize_entry(
+                    "Hashtree",
+                    &V {
+                        dm_verity_version: *dm_verity_version,
+                        image_size: *image_size,
+                        tree_offset: *tree_offset,
+                        tree_size: *tree_size,
+                        data_block_size: *data_block_size,
+                        hash_block_size: *hash_block_size,
+                        fec_num_roots: *fec_num_roots,
+                        fec_offset: *fec_offset,
+                        fec_size: *fec_size,
+                        hash_algorithm,
+                        partition_name,
+                        salt: bytes_to_hex(salt),
+                        root_digest: bytes_to_hex(root_digest),
+                        flags: *flags,
+                    },
+                )?;
             }
-            DescriptorInfo::KernelCmdline { flags, kernel_cmdline } => {
+            DescriptorInfo::KernelCmdline {
+                flags,
+                kernel_cmdline,
+            } => {
                 #[derive(Serialize)]
                 struct V<'b> {
                     flags: u32,
                     kernel_cmdline: &'b str,
                 }
-                map.serialize_entry("KernelCmdline", &V {
-                    flags: *flags,
-                    kernel_cmdline,
-                })?;
+                map.serialize_entry(
+                    "KernelCmdline",
+                    &V {
+                        flags: *flags,
+                        kernel_cmdline,
+                    },
+                )?;
             }
-            DescriptorInfo::ChainPartition { rollback_index_location, partition_name, public_key, flags } => {
+            DescriptorInfo::ChainPartition {
+                rollback_index_location,
+                partition_name,
+                public_key,
+                flags,
+            } => {
                 #[derive(Serialize)]
                 struct V<'b> {
                     rollback_index_location: u32,
@@ -222,23 +280,33 @@ impl<'a> Serialize for JsonDescriptor<'a> {
                     hasher.update(public_key);
                     format!("{:x}", hasher.finalize())
                 };
-                map.serialize_entry("ChainPartition", &V {
-                    rollback_index_location: *rollback_index_location,
-                    partition_name,
-                    public_key_sha1: pk_sha1,
-                    flags: *flags,
-                })?;
+                map.serialize_entry(
+                    "ChainPartition",
+                    &V {
+                        rollback_index_location: *rollback_index_location,
+                        partition_name,
+                        public_key_sha1: pk_sha1,
+                        flags: *flags,
+                    },
+                )?;
             }
-            DescriptorInfo::Unknown { tag, num_bytes_following, .. } => {
+            DescriptorInfo::Unknown {
+                tag,
+                num_bytes_following,
+                ..
+            } => {
                 #[derive(Serialize)]
                 struct V {
                     tag: u64,
                     num_bytes_following: u64,
                 }
-                map.serialize_entry("Unknown", &V {
-                    tag: *tag,
-                    num_bytes_following: *num_bytes_following,
-                })?;
+                map.serialize_entry(
+                    "Unknown",
+                    &V {
+                        tag: *tag,
+                        num_bytes_following: *num_bytes_following,
+                    },
+                )?;
             }
         }
         map.end()
@@ -272,13 +340,27 @@ pub fn scan_input(input: &Path) -> Result<Vec<ScanEntry>> {
     Ok(paths.into_iter().map(scan_one).collect())
 }
 
+/// Render multi-entry scan output.
+///
+/// Directory/multi-file reports intentionally keep local headers (`Image`,
+/// `File size`, `AVB image type`) as JSON-era extensions. Single pure AVB
+/// bodies still use dense AOSP 1.4.0 field layout.
 pub fn render_scan_report(entries: &[ScanEntry]) -> String {
+    render_scan_report_with_options(entries, &InfoRenderOptions::default())
+}
+
+pub fn render_scan_report_with_options(
+    entries: &[ScanEntry],
+    options: &InfoRenderOptions,
+) -> String {
     let mut out = String::new();
 
     for (index, entry) in entries.iter().enumerate() {
         if index > 0 {
             out.push_str("\n================================================================\n\n");
         }
+
+        // Local multi-scan extension headers (not present in AOSP info_image).
         let _ = writeln!(out, "Image:                   {}", entry.path.display());
         let _ = writeln!(out, "File size:               {} bytes", entry.file_size);
 
@@ -289,7 +371,7 @@ pub fn render_scan_report(entries: &[ScanEntry]) -> String {
             }
             ScanResult::Error(message) => {
                 out.push_str("AVB image type:          error\n");
-                let _ = writeln!(out, "AVB parse error:         {}", message);
+                let _ = writeln!(out, "AVB parse error:         {message}");
             }
             ScanResult::Avb(info) => {
                 let _ = writeln!(
@@ -297,80 +379,7 @@ pub fn render_scan_report(entries: &[ScanEntry]) -> String {
                     "AVB image type:          {}",
                     avb_image_type_name(&info.image_type)
                 );
-
-                if let Some(footer) = &info.footer {
-                    let _ = writeln!(
-                        out,
-                        "Footer version:          {}.{}",
-                        footer.version_major, footer.version_minor
-                    );
-                    let _ = writeln!(
-                        out,
-                        "Original image size:     {} bytes",
-                        footer.original_image_size
-                    );
-                    let _ = writeln!(out, "VBMeta offset:           {}", footer.vbmeta_offset);
-                    let _ = writeln!(out, "VBMeta size:             {} bytes", footer.vbmeta_size);
-                    out.push_str("--\n");
-                } else {
-                    let _ = writeln!(out, "VBMeta offset:           {}", info.vbmeta_offset);
-                    let _ = writeln!(out, "VBMeta size:             {} bytes", info.vbmeta_size);
-                }
-
-                let _ = writeln!(
-                    out,
-                    "Minimum libavb version:  {}.{}",
-                    info.header.required_libavb_version_major,
-                    info.header.required_libavb_version_minor
-                );
-                let _ = writeln!(
-                    out,
-                    "Header Block:            {} bytes",
-                    AVB_VBMETA_IMAGE_HEADER_SIZE
-                );
-                let _ = writeln!(
-                    out,
-                    "Authentication Block:    {} bytes",
-                    info.header.authentication_data_block_size
-                );
-                let _ = writeln!(
-                    out,
-                    "Auxiliary Block:         {} bytes",
-                    info.header.auxiliary_data_block_size
-                );
-                if let Some(public_key_sha1) = &info.public_key_sha1 {
-                    let _ = writeln!(out, "Public key (sha1):       {}", public_key_sha1);
-                }
-                let _ = writeln!(
-                    out,
-                    "Algorithm:               {}",
-                    algorithm_name(info.header.algorithm_type)
-                );
-                let _ = writeln!(
-                    out,
-                    "Rollback Index:          {}",
-                    info.header.rollback_index
-                );
-                let _ = writeln!(out, "Flags:                   {}", info.header.flags);
-                let _ = writeln!(
-                    out,
-                    "Rollback Index Location: {}",
-                    info.header.rollback_index_location
-                );
-                let _ = writeln!(
-                    out,
-                    "Release String:          '{}'",
-                    info.header.release_string
-                );
-                out.push_str("Descriptors:\n");
-
-                if info.descriptors.is_empty() {
-                    out.push_str("    (none)\n");
-                } else {
-                    for descriptor in &info.descriptors {
-                        render_descriptor(&mut out, descriptor);
-                    }
-                }
+                out.push_str(&render_avb_info_aosp(info, entry.file_size, options));
             }
         }
     }
@@ -378,9 +387,140 @@ pub fn render_scan_report(entries: &[ScanEntry]) -> String {
     out
 }
 
+/// Dense AOSP `info_image` text for a parsed AVB image.
+pub fn render_avb_info_aosp(
+    info: &AvbImageInfo,
+    image_size: u64,
+    options: &InfoRenderOptions,
+) -> String {
+    let mut out = String::new();
+
+    if let Some(footer) = &info.footer {
+        write_field(
+            &mut out,
+            "Footer version:",
+            format!("{}.{}", footer.version_major, footer.version_minor),
+        );
+        write_field(&mut out, "Image size:", format!("{image_size} bytes"));
+        write_field(
+            &mut out,
+            "Original image size:",
+            format!("{} bytes", footer.original_image_size),
+        );
+        write_field(&mut out, "VBMeta offset:", footer.vbmeta_offset);
+        write_field(
+            &mut out,
+            "VBMeta size:",
+            format!("{} bytes", footer.vbmeta_size),
+        );
+        out.push_str("--\n");
+    }
+
+    let sparse_marker = if options.sparse { " (Sparse)" } else { "" };
+    write_field(
+        &mut out,
+        "Minimum libavb version:",
+        format!(
+            "{}.{}{sparse_marker}",
+            info.header.required_libavb_version_major, info.header.required_libavb_version_minor
+        ),
+    );
+    write_field(
+        &mut out,
+        "Header Block:",
+        format!("{AVB_VBMETA_IMAGE_HEADER_SIZE} bytes"),
+    );
+    write_field(
+        &mut out,
+        "Authentication Block:",
+        format!("{} bytes", info.header.authentication_data_block_size),
+    );
+    write_field(
+        &mut out,
+        "Auxiliary Block:",
+        format!("{} bytes", info.header.auxiliary_data_block_size),
+    );
+    if let Some(public_key_sha1) = &info.public_key_sha1 {
+        write_field(&mut out, "Public key (sha1):", public_key_sha1);
+    }
+    write_field(&mut out, "Algorithm:", &info.algorithm_name);
+    write_field(&mut out, "Rollback Index:", info.header.rollback_index);
+    write_field(&mut out, "Flags:", info.header.flags);
+    write_field(
+        &mut out,
+        "Rollback Index Location:",
+        info.header.rollback_index_location,
+    );
+    write_field(
+        &mut out,
+        "Release String:",
+        format!("'{}'", info.header.release_string),
+    );
+
+    out.push_str("Descriptors:\n");
+    if info.descriptors.is_empty() {
+        out.push_str("    (none)\n");
+    } else {
+        for descriptor in &info.descriptors {
+            render_descriptor(&mut out, descriptor);
+        }
+    }
+
+    if options.include_cert {
+        match options.cert_text.as_ref() {
+            Some(cert_text) if !cert_text.is_empty() => {
+                if !cert_text.starts_with("avb_cert certificate:") {
+                    out.push_str("avb_cert certificate:\n");
+                }
+                out.push_str(cert_text);
+                if !cert_text.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
 pub fn generate_info_report(input: &Path) -> Result<String> {
+    generate_info_report_with_options(input, &InfoRenderOptions::default())
+}
+
+/// Generate info text with optional sparse/cert hooks.
+///
+/// Single AVB images emit pure AOSP dense text (no local multi-scan headers).
+/// Multi-file scans keep local extension headers for directory workflows.
+pub fn generate_info_report_with_options(
+    input: &Path,
+    options: &InfoRenderOptions,
+) -> Result<String> {
     let entries = scan_input(input)?;
-    Ok(render_scan_report(&entries))
+    if entries.len() == 1 {
+        #[allow(clippy::collapsible_if)]
+        if let ScanResult::Avb(info) = &entries[0].result {
+            let mut render = options.clone();
+            if !render.sparse
+                && let Ok(handler) = ImageHandler::open(input, true)
+            {
+                render.sparse = handler.is_sparse();
+            }
+            return Ok(render_avb_info_aosp(info, entries[0].file_size, &render));
+        }
+    }
+    let mut render = options.clone();
+    if !render.sparse
+        && let Ok(handler) = ImageHandler::open(input, true)
+    {
+        render.sparse = handler.is_sparse();
+    }
+    Ok(render_scan_report_with_options(&entries, &render))
+}
+
+fn write_field(out: &mut String, label: &str, value: impl std::fmt::Display) {
+    // AOSP pads labels to width 26 including the trailing colon.
+    let _ = writeln!(out, "{label:<26}{value}");
 }
 
 fn collect_dir_images(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -403,24 +543,27 @@ fn collect_dir_images(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 fn scan_one(path: PathBuf) -> ScanEntry {
-    match fs::metadata(&path) {
-        Ok(metadata) => match inspect_image(&path, metadata.len()) {
-            Ok(Some(info)) => ScanEntry {
-                path,
-                file_size: metadata.len(),
-                result: ScanResult::Avb(info),
-            },
-            Ok(None) => ScanEntry {
-                path,
-                file_size: metadata.len(),
-                result: ScanResult::None,
-            },
-            Err(error) => ScanEntry {
-                path,
-                file_size: metadata.len(),
-                result: ScanResult::Error(error.to_string()),
-            },
-        },
+    match ImageHandler::open(&path, true) {
+        Ok(handler) => {
+            let logical_size = handler.image_size();
+            match inspect_image(&path, logical_size) {
+                Ok(Some(info)) => ScanEntry {
+                    path,
+                    file_size: logical_size,
+                    result: ScanResult::Avb(info),
+                },
+                Ok(None) => ScanEntry {
+                    path,
+                    file_size: logical_size,
+                    result: ScanResult::None,
+                },
+                Err(error) => ScanEntry {
+                    path,
+                    file_size: logical_size,
+                    result: ScanResult::Error(error.to_string()),
+                },
+            }
+        }
         Err(error) => ScanEntry {
             path,
             file_size: 0,
@@ -429,18 +572,18 @@ fn scan_one(path: PathBuf) -> ScanEntry {
     }
 }
 
-fn inspect_image(path: &Path, file_size: u64) -> Result<Option<AvbImageInfo>> {
+fn inspect_image(path: &Path, image_size: u64) -> Result<Option<AvbImageInfo>> {
     let image_type = detect_avb_image_type(path)?;
     if image_type == AvbImageType::None {
         return Ok(None);
     }
 
-    let mut file = File::open(path)?;
+    let mut image = ImageHandler::open(path, true).map_err(sparse_err)?;
     match image_type {
         AvbImageType::Vbmeta => {
-            let header = read_header_at(&mut file, 0)?;
+            let header = crate::image::read_header_at(&mut image, 0)?;
             let vbmeta_size = compute_vbmeta_blob_size(&header)?;
-            let blob = read_exact_at(&mut file, 0, u64_to_usize(vbmeta_size, "vbmeta size")?)?;
+            let blob = read_exact_at(&mut image, 0, u64_to_usize(vbmeta_size, "vbmeta size")?)?;
             let (header, parsed_vbmeta_size, public_key_sha1, descriptors) =
                 parse_vbmeta_blob(&blob)?;
             let algorithm_name = lookup_algorithm_by_type(header.algorithm_type)
@@ -458,20 +601,24 @@ fn inspect_image(path: &Path, file_size: u64) -> Result<Option<AvbImageInfo>> {
             }))
         }
         AvbImageType::Footer => {
-            if file_size < AVB_FOOTER_SIZE {
+            if image_size < AVB_FOOTER_SIZE {
                 return Err(DynoError::Tool(format!(
                     "Footer image too small: {}",
                     path.display()
                 )));
             }
 
-            file.seek(SeekFrom::End(-(AVB_FOOTER_SIZE as i64)))?;
-            let footer = AvbFooter::from_reader(&mut file)?;
+            let footer_bytes = read_exact_at(
+                &mut image,
+                image_size - AVB_FOOTER_SIZE,
+                AVB_FOOTER_SIZE as usize,
+            )?;
+            let footer = AvbFooter::from_reader(footer_bytes.as_slice())?;
             let footer_end = footer
                 .vbmeta_offset
                 .checked_add(footer.vbmeta_size)
                 .ok_or_else(|| DynoError::Tool("VBMeta range overflow in footer".into()))?;
-            if footer_end > file_size {
+            if footer_end > image_size {
                 return Err(DynoError::Tool(format!(
                     "VBMeta range exceeds file size in {}",
                     path.display()
@@ -479,7 +626,7 @@ fn inspect_image(path: &Path, file_size: u64) -> Result<Option<AvbImageInfo>> {
             }
 
             let blob = read_exact_at(
-                &mut file,
+                &mut image,
                 footer.vbmeta_offset,
                 u64_to_usize(footer.vbmeta_size, "footer vbmeta size")?,
             )?;
@@ -501,18 +648,6 @@ fn inspect_image(path: &Path, file_size: u64) -> Result<Option<AvbImageInfo>> {
         }
         AvbImageType::None => Ok(None),
     }
-}
-
-fn read_header_at(file: &mut File, offset: u64) -> Result<AvbVBMetaHeader> {
-    let header_bytes = read_exact_at(file, offset, AVB_VBMETA_IMAGE_HEADER_SIZE)?;
-    AvbVBMetaHeader::from_reader(Cursor::new(header_bytes))
-}
-
-fn read_exact_at(file: &mut File, offset: u64, size: usize) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; size];
-    file.seek(SeekFrom::Start(offset))?;
-    file.read_exact(&mut buf)?;
-    Ok(buf)
 }
 
 fn parse_vbmeta_blob(
@@ -887,14 +1022,11 @@ fn parse_chain_partition_descriptor(
 
 fn render_descriptor(out: &mut String, descriptor: &DescriptorInfo) {
     match descriptor {
-        DescriptorInfo::Property {
-            key,
-            value,
-        } => {
+        DescriptorInfo::Property { key, value } => {
             if value.len() < 256 {
-                let _ = writeln!(out, "    Prop: {} -> {}", key, format_property_value(value));
+                let _ = writeln!(out, "    Prop: {key} -> {}", format_property_value(value));
             } else {
-                let _ = writeln!(out, "    Prop: {} -> ({} bytes)", key, value.len());
+                let _ = writeln!(out, "    Prop: {key} -> ({} bytes)", value.len());
             }
         }
         DescriptorInfo::Hashtree {
@@ -914,32 +1046,24 @@ fn render_descriptor(out: &mut String, descriptor: &DescriptorInfo) {
             flags,
         } => {
             out.push_str("    Hashtree descriptor:\n");
-            let _ = writeln!(out, "      Version of dm-verity:  {}", dm_verity_version);
-            let _ = writeln!(out, "      Image Size:            {} bytes", image_size);
-            let _ = writeln!(out, "      Tree Offset:           {}", tree_offset);
-            let _ = writeln!(out, "      Tree Size:             {} bytes", tree_size);
-            let _ = writeln!(
-                out,
-                "      Data Block Size:       {} bytes",
-                data_block_size
-            );
-            let _ = writeln!(
-                out,
-                "      Hash Block Size:       {} bytes",
-                hash_block_size
-            );
-            let _ = writeln!(out, "      FEC num roots:         {}", fec_num_roots);
-            let _ = writeln!(out, "      FEC offset:            {}", fec_offset);
-            let _ = writeln!(out, "      FEC size:              {} bytes", fec_size);
-            let _ = writeln!(out, "      Hash Algorithm:        {}", hash_algorithm);
-            let _ = writeln!(out, "      Partition Name:        {}", partition_name);
+            let _ = writeln!(out, "      Version of dm-verity:  {dm_verity_version}");
+            let _ = writeln!(out, "      Image Size:            {image_size} bytes");
+            let _ = writeln!(out, "      Tree Offset:           {tree_offset}");
+            let _ = writeln!(out, "      Tree Size:             {tree_size} bytes");
+            let _ = writeln!(out, "      Data Block Size:       {data_block_size} bytes");
+            let _ = writeln!(out, "      Hash Block Size:       {hash_block_size} bytes");
+            let _ = writeln!(out, "      FEC num roots:         {fec_num_roots}");
+            let _ = writeln!(out, "      FEC offset:            {fec_offset}");
+            let _ = writeln!(out, "      FEC size:              {fec_size} bytes");
+            let _ = writeln!(out, "      Hash Algorithm:        {hash_algorithm}");
+            let _ = writeln!(out, "      Partition Name:        {partition_name}");
             let _ = writeln!(out, "      Salt:                  {}", bytes_to_hex(salt));
             let _ = writeln!(
                 out,
                 "      Root Digest:           {}",
                 bytes_to_hex(root_digest)
             );
-            let _ = writeln!(out, "      Flags:                 {}", flags);
+            let _ = writeln!(out, "      Flags:                 {flags}");
         }
         DescriptorInfo::Hash {
             image_size,
@@ -950,20 +1074,20 @@ fn render_descriptor(out: &mut String, descriptor: &DescriptorInfo) {
             flags,
         } => {
             out.push_str("    Hash descriptor:\n");
-            let _ = writeln!(out, "      Image Size:            {} bytes", image_size);
-            let _ = writeln!(out, "      Hash Algorithm:        {}", hash_algorithm);
-            let _ = writeln!(out, "      Partition Name:        {}", partition_name);
+            let _ = writeln!(out, "      Image Size:            {image_size} bytes");
+            let _ = writeln!(out, "      Hash Algorithm:        {hash_algorithm}");
+            let _ = writeln!(out, "      Partition Name:        {partition_name}");
             let _ = writeln!(out, "      Salt:                  {}", bytes_to_hex(salt));
             let _ = writeln!(out, "      Digest:                {}", bytes_to_hex(digest));
-            let _ = writeln!(out, "      Flags:                 {}", flags);
+            let _ = writeln!(out, "      Flags:                 {flags}");
         }
         DescriptorInfo::KernelCmdline {
             flags,
             kernel_cmdline,
         } => {
             out.push_str("    Kernel Cmdline descriptor:\n");
-            let _ = writeln!(out, "      Flags:                 {}", flags);
-            let _ = writeln!(out, "      Kernel Cmdline:        '{}'", kernel_cmdline);
+            let _ = writeln!(out, "      Flags:                 {flags}");
+            let _ = writeln!(out, "      Kernel Cmdline:        '{kernel_cmdline}'");
         }
         DescriptorInfo::ChainPartition {
             rollback_index_location,
@@ -972,23 +1096,31 @@ fn render_descriptor(out: &mut String, descriptor: &DescriptorInfo) {
             flags,
         } => {
             out.push_str("    Chain Partition descriptor:\n");
-            let _ = writeln!(out, "      Partition Name:          {}", partition_name);
+            let _ = writeln!(out, "      Partition Name:          {partition_name}");
             let _ = writeln!(
                 out,
-                "      Rollback Index Location: {}",
-                rollback_index_location
+                "      Rollback Index Location: {rollback_index_location}"
             );
-            let _ = writeln!(out, "      Public key (sha1):       {}", sha1_hex(public_key));
-            let _ = writeln!(out, "      Flags:                   {}", flags);
+            let _ = writeln!(
+                out,
+                "      Public key (sha1):       {}",
+                sha1_hex(public_key)
+            );
+            let _ = writeln!(out, "      Flags:                   {flags}");
         }
-        DescriptorInfo::Unknown {
-            tag,
-            num_bytes_following,
-            ..
-        } => {
+        DescriptorInfo::Unknown { tag, body, .. } => {
             out.push_str("    Unknown descriptor:\n");
-            let _ = writeln!(out, "      Tag:                   {}", tag);
-            let _ = writeln!(out, "      Bytes Following:       {}", num_bytes_following);
+            let _ = writeln!(out, "      Tag:  {tag}");
+            if body.len() < 256 {
+                let _ = writeln!(
+                    out,
+                    "      Data: {} ({} bytes)",
+                    format_property_value(body),
+                    body.len()
+                );
+            } else {
+                let _ = writeln!(out, "      Data: {} bytes", body.len());
+            }
         }
     }
 }
@@ -1012,8 +1144,7 @@ fn checked_range(total: usize, offset: usize, size: usize, field: &str) -> Resul
         .ok_or_else(|| DynoError::Tool(format!("{field} range overflow")))?;
     if end > total {
         return Err(DynoError::Tool(format!(
-            "{field} range exceeds buffer: offset {} size {} total {}",
-            offset, size, total
+            "{field} range exceeds buffer: offset {offset} size {size} total {total}"
         )));
     }
     Ok(offset..end)
@@ -1028,11 +1159,10 @@ fn expect_byte(data: &[u8], offset: usize, expected: u8, field: &str) -> Result<
     let actual = data
         .get(offset)
         .copied()
-        .ok_or_else(|| DynoError::Tool(format!("{field} missing at offset {}", offset)))?;
+        .ok_or_else(|| DynoError::Tool(format!("{field} missing at offset {offset}")))?;
     if actual != expected {
         return Err(DynoError::Tool(format!(
-            "{field} invalid: expected {}, got {}",
-            expected, actual
+            "{field} invalid: expected {expected}, got {actual}"
         )));
     }
     Ok(())
@@ -1041,8 +1171,7 @@ fn expect_byte(data: &[u8], offset: usize, expected: u8, field: &str) -> Result<
 fn ensure_len(data: &[u8], minimum_len: usize, field: &str) -> Result<()> {
     if data.len() < minimum_len {
         return Err(DynoError::Tool(format!(
-            "{field} shorter than expected: need at least {} bytes, got {} bytes",
-            minimum_len,
+            "{field} shorter than expected: need at least {minimum_len} bytes, got {} bytes",
             data.len()
         )));
     }
@@ -1051,7 +1180,7 @@ fn ensure_len(data: &[u8], minimum_len: usize, field: &str) -> Result<()> {
 
 fn read_utf8(data: &[u8]) -> Result<String> {
     String::from_utf8(data.to_vec())
-        .map_err(|error| DynoError::Tool(format!("Invalid UTF-8 data: {}", error)))
+        .map_err(|error| DynoError::Tool(format!("Invalid UTF-8 data: {error}")))
 }
 
 fn read_cstring_ascii(data: &[u8]) -> Result<String> {
@@ -1061,20 +1190,29 @@ fn read_cstring_ascii(data: &[u8]) -> Result<String> {
         .unwrap_or(data.len());
     let slice = &data[..len];
     let text = std::str::from_utf8(slice)
-        .map_err(|error| DynoError::Tool(format!("Invalid ASCII/UTF-8 string: {}", error)))?;
+        .map_err(|error| DynoError::Tool(format!("Invalid ASCII/UTF-8 string: {error}")))?;
     Ok(text.to_string())
 }
 
+/// Format property bytes like Python `repr(bytes)` with the leading `b` removed.
 fn format_property_value(value: &[u8]) -> String {
-    if value.len() >= 256 {
-        return format!("({} bytes)", value.len());
-    }
-    if let Ok(text) = std::str::from_utf8(value) {
-        if text.chars().all(|c| !c.is_control()) {
-            return format!("'{}'", text.escape_default());
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for &byte in value {
+        match byte {
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            b'\\' => out.push_str("\\\\"),
+            b'\'' => out.push_str("\\'"),
+            0x20..=0x7e => out.push(byte as char),
+            _ => {
+                let _ = write!(out, "\\x{byte:02x}");
+            }
         }
     }
-    format!("0x{}", bytes_to_hex(value))
+    out.push('\'');
+    out
 }
 
 fn sha1_hex(bytes: &[u8]) -> String {
@@ -1095,12 +1233,12 @@ fn round_to_multiple(number: usize, size: usize) -> usize {
 
 fn u64_to_usize(value: u64, field: &str) -> Result<usize> {
     usize::try_from(value)
-        .map_err(|_| DynoError::Tool(format!("{field} does not fit in usize: {}", value)))
+        .map_err(|_| DynoError::Tool(format!("{field} does not fit in usize: {value}")))
 }
 
 fn u32_to_usize(value: u32, field: &str) -> Result<usize> {
     usize::try_from(value)
-        .map_err(|_| DynoError::Tool(format!("{field} does not fit in usize: {}", value)))
+        .map_err(|_| DynoError::Tool(format!("{field} does not fit in usize: {value}")))
 }
 
 fn avb_image_type_name(image_type: &AvbImageType) -> &'static str {
@@ -1111,27 +1249,160 @@ fn avb_image_type_name(image_type: &AvbImageType) -> &'static str {
     }
 }
 
-fn algorithm_name(algorithm_type: u32) -> &'static str {
-    match algorithm_type {
-        0 => "NONE",
-        1 => "SHA256_RSA2048",
-        2 => "SHA256_RSA4096",
-        3 => "SHA256_RSA8192",
-        4 => "SHA512_RSA2048",
-        5 => "SHA512_RSA4096",
-        6 => "SHA512_RSA8192",
-        7 => "MLDSA65",
-        8 => "MLDSA87",
-        _ => "UNKNOWN",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use byteorder::WriteBytesExt;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn pure_vbmeta_info_matches_aosp_layout() -> Result<()> {
+        let descriptor = make_hash_descriptor("boot", b"\x11\x22", &[0x33; 32])?;
+        let prop = make_property_descriptor("foo", b"brillo")?;
+        let vbmeta = make_vbmeta_blob(vec![prop, descriptor], b"public-key");
+
+        let mut file = NamedTempFile::new()?;
+        std::io::Write::write_all(&mut file, &vbmeta)?;
+
+        let report = generate_info_report(file.path())?;
+
+        // Pure single-image path: no local multi-scan headers.
+        assert!(!report.contains("Image:"));
+        assert!(!report.contains("AVB image type:"));
+        assert!(!report.contains("File size:"));
+        assert!(!report.starts_with("Footer version:"));
+
+        let expected_prefix = format!(
+            "Minimum libavb version:   1.0\n\
+Header Block:             {AVB_VBMETA_IMAGE_HEADER_SIZE} bytes\n\
+Authentication Block:     0 bytes\n\
+Auxiliary Block:          "
+        );
+        assert!(
+            report.starts_with(&expected_prefix),
+            "report was:\n{report}"
+        );
+        assert!(report.contains("Public key (sha1):        "));
+        assert!(report.contains("Algorithm:                NONE"));
+        assert!(report.contains("Rollback Index:           7"));
+        assert!(report.contains("Flags:                    0"));
+        assert!(report.contains("Rollback Index Location:  0"));
+        assert!(report.contains("Release String:           'unit-test'"));
+        assert!(report.contains("    Prop: foo -> 'brillo'\n"));
+        assert!(report.contains("    Hash descriptor:\n"));
+        assert!(report.contains("      Partition Name:        boot\n"));
+        assert!(report.contains("      Salt:                  1122\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn footer_info_includes_image_size_line() -> Result<()> {
+        let vbmeta = make_vbmeta_blob(Vec::new(), b"footer-key");
+        let original_size = 4096u64;
+
+        let mut image = vec![0u8; original_size as usize];
+        image.extend_from_slice(&vbmeta);
+        image.extend_from_slice(&make_footer(
+            original_size,
+            original_size,
+            vbmeta.len() as u64,
+        ));
+
+        let mut file = NamedTempFile::new()?;
+        std::io::Write::write_all(&mut file, &image)?;
+
+        let report = generate_info_report(file.path())?;
+        let image_size = image.len() as u64;
+
+        assert!(!report.contains("Image:"));
+        assert!(report.starts_with("Footer version:           1.0\n"));
+        assert!(report.contains(&format!("Image size:               {image_size} bytes\n")));
+        assert!(report.contains("Original image size:      4096 bytes\n"));
+        assert!(report.contains(&format!("VBMeta offset:            {original_size}\n")));
+        assert!(report.contains(&format!(
+            "VBMeta size:              {} bytes\n",
+            vbmeta.len()
+        )));
+        assert!(report.contains("--\nMinimum libavb version:   1.0\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn property_and_unknown_descriptor_formatting() {
+        let mut out = String::new();
+        render_descriptor(
+            &mut out,
+            &DescriptorInfo::Property {
+                key: "blob".into(),
+                value: b"\x00\x00brillo ftw!\n".to_vec(),
+            },
+        );
+        assert_eq!(out, "    Prop: blob -> '\\x00\\x00brillo ftw!\\n'\n");
+
+        out.clear();
+        render_descriptor(
+            &mut out,
+            &DescriptorInfo::Property {
+                key: "large_blob".into(),
+                value: vec![0u8; 2048],
+            },
+        );
+        assert_eq!(out, "    Prop: large_blob -> (2048 bytes)\n");
+
+        out.clear();
+        render_descriptor(
+            &mut out,
+            &DescriptorInfo::Unknown {
+                tag: 99,
+                num_bytes_following: 8,
+                body: b"abcd".to_vec(),
+            },
+        );
+        assert_eq!(
+            out,
+            "    Unknown descriptor:\n      Tag:  99\n      Data: 'abcd' (4 bytes)\n"
+        );
+    }
+
+    #[test]
+    fn sparse_and_cert_hooks_are_optional() {
+        let info = AvbImageInfo {
+            image_type: AvbImageType::Vbmeta,
+            footer: None,
+            vbmeta_offset: 0,
+            vbmeta_size: AVB_VBMETA_IMAGE_HEADER_SIZE as u64,
+            header: crate::image::default_vbmeta_header(),
+            algorithm_name: "NONE".into(),
+            public_key_sha1: None,
+            descriptors: Vec::new(),
+        };
+
+        let sparse = render_avb_info_aosp(
+            &info,
+            0,
+            &InfoRenderOptions {
+                sparse: true,
+                include_cert: false,
+                cert_text: None,
+            },
+        );
+        assert!(sparse.contains("Minimum libavb version:   1.0 (Sparse)\n"));
+
+        let with_cert = render_avb_info_aosp(
+            &info,
+            0,
+            &InfoRenderOptions {
+                sparse: false,
+                include_cert: true,
+                cert_text: Some(
+                    "    Metadata version:        1\n    Product Intermediate Key:\n".into(),
+                ),
+            },
+        );
+        assert!(with_cert.contains("avb_cert certificate:\n"));
+        assert!(with_cert.contains("    Metadata version:        1\n"));
+    }
 
     #[test]
     fn scan_standalone_vbmeta_image() -> Result<()> {
@@ -1171,8 +1442,9 @@ mod tests {
         let report = render_scan_report(&entries);
 
         assert!(report.contains("AVB image type:          footer"));
-        assert!(report.contains("Footer version:          1.0"));
-        assert!(report.contains("Original image size:     4096 bytes"));
+        assert!(report.contains("Footer version:           1.0"));
+        assert!(report.contains("Image size:               "));
+        assert!(report.contains("Original image size:      4096 bytes"));
         Ok(())
     }
 
@@ -1244,6 +1516,32 @@ mod tests {
         descriptor.extend_from_slice(name_bytes);
         descriptor.extend_from_slice(salt);
         descriptor.extend_from_slice(digest);
+
+        let total_size = DESCRIPTOR_HEADER_SIZE + (num_bytes_following as usize);
+        descriptor.resize(total_size, 0);
+        Ok(descriptor)
+    }
+
+    fn make_property_descriptor(key: &str, value: &[u8]) -> Result<Vec<u8>> {
+        let key_bytes = key.as_bytes();
+        let mut descriptor = Vec::new();
+        let num_bytes_following = round_to_multiple(
+            (PROPERTY_DESCRIPTOR_SIZE - DESCRIPTOR_HEADER_SIZE)
+                + key_bytes.len()
+                + 1
+                + value.len()
+                + 1,
+            8,
+        ) as u64;
+
+        descriptor.write_u64::<BigEndian>(DESCRIPTOR_TAG_PROPERTY)?;
+        descriptor.write_u64::<BigEndian>(num_bytes_following)?;
+        descriptor.write_u64::<BigEndian>(key_bytes.len() as u64)?;
+        descriptor.write_u64::<BigEndian>(value.len() as u64)?;
+        descriptor.extend_from_slice(key_bytes);
+        descriptor.push(0);
+        descriptor.extend_from_slice(value);
+        descriptor.push(0);
 
         let total_size = DESCRIPTOR_HEADER_SIZE + (num_bytes_following as usize);
         descriptor.resize(total_size, 0);

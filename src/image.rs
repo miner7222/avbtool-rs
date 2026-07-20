@@ -1,5 +1,4 @@
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::Path;
 
 use byteorder::{BigEndian, WriteBytesExt};
@@ -8,14 +7,15 @@ use crate::error::{AvbToolError as DynoError, Result};
 use crate::info::{AvbImageInfo, ScanResult, scan_input};
 use crate::parser::{
     AVB_FOOTER_SIZE, AVB_MAGIC, AVB_VBMETA_IMAGE_HEADER_SIZE, AvbFooter, AvbImageType,
-    AvbVBMetaHeader, detect_avb_image_type,
+    AvbVBMetaHeader, detect_avb_image_type, sparse_err,
 };
+use crate::sparse::ImageHandler;
 
 pub fn inspect_avb_image(path: &Path) -> Result<AvbImageInfo> {
     let mut entries = scan_input(path)?;
-    let entry = entries
-        .pop()
-        .ok_or_else(|| DynoError::Tool(format!("No AVB entries returned for {}", path.display())))?;
+    let entry = entries.pop().ok_or_else(|| {
+        DynoError::Tool(format!("No AVB entries returned for {}", path.display()))
+    })?;
     match entry.result {
         ScanResult::Avb(info) => Ok(info),
         ScanResult::None => Err(DynoError::Tool(format!(
@@ -35,24 +35,31 @@ pub fn load_vbmeta_blob(path: &Path) -> Result<Vec<u8>> {
         )));
     }
 
-    let mut file = File::open(path)?;
-    let file_size = file.metadata()?.len();
+    let mut image = ImageHandler::open(path, true).map_err(sparse_err)?;
+    let image_size = image.image_size();
     match image_type {
         AvbImageType::Vbmeta => {
-            let header = read_header_at(&mut file, 0)?;
+            let header = read_header_at(&mut image, 0)?;
             let size = compute_vbmeta_blob_size(&header)?;
-            read_exact_at(&mut file, 0, size as usize)
+            read_exact_at(&mut image, 0, size as usize)
         }
         AvbImageType::Footer => {
-            file.seek(SeekFrom::End(-(AVB_FOOTER_SIZE as i64)))?;
-            let footer = AvbFooter::from_reader(&mut file)?;
-            if footer.vbmeta_offset + footer.vbmeta_size > file_size {
+            image
+                .seek(image_size - AVB_FOOTER_SIZE)
+                .map_err(sparse_err)?;
+            let footer_bytes = image.read(AVB_FOOTER_SIZE as usize).map_err(sparse_err)?;
+            let footer = AvbFooter::from_reader(footer_bytes.as_slice())?;
+            if footer.vbmeta_offset + footer.vbmeta_size > image_size {
                 return Err(DynoError::Tool(format!(
                     "VBMeta range exceeds file size in {}",
                     path.display()
                 )));
             }
-            read_exact_at(&mut file, footer.vbmeta_offset, footer.vbmeta_size as usize)
+            read_exact_at(
+                &mut image,
+                footer.vbmeta_offset,
+                footer.vbmeta_size as usize,
+            )
         }
         AvbImageType::None => unreachable!(),
     }
@@ -81,16 +88,27 @@ pub fn compute_vbmeta_blob_size(header: &AvbVBMetaHeader) -> Result<u64> {
         .ok_or_else(|| DynoError::Tool("VBMeta size overflow".into()))
 }
 
-pub fn read_header_at(file: &mut File, offset: u64) -> Result<AvbVBMetaHeader> {
-    let bytes = read_exact_at(file, offset, AVB_VBMETA_IMAGE_HEADER_SIZE)?;
+pub fn read_header_at(image: &mut ImageHandler, offset: u64) -> Result<AvbVBMetaHeader> {
+    let bytes = read_exact_at(image, offset, AVB_VBMETA_IMAGE_HEADER_SIZE)?;
     AvbVBMetaHeader::from_reader(bytes.as_slice())
 }
 
-pub fn read_exact_at(file: &mut File, offset: u64, size: usize) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; size];
-    file.seek(SeekFrom::Start(offset))?;
-    file.read_exact(&mut buf)?;
-    Ok(buf)
+pub fn read_exact_at(image: &mut ImageHandler, offset: u64, size: usize) -> Result<Vec<u8>> {
+    image.seek(offset).map_err(sparse_err)?;
+    let mut remaining = size;
+    let mut out = Vec::with_capacity(size);
+    while remaining > 0 {
+        let chunk = image.read(remaining).map_err(sparse_err)?;
+        if chunk.is_empty() {
+            return Err(DynoError::Tool(format!(
+                "Unexpected EOF reading {} bytes at logical offset {}",
+                size, offset
+            )));
+        }
+        remaining -= chunk.len();
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 pub fn encode_header(header: &AvbVBMetaHeader) -> Vec<u8> {
@@ -109,13 +127,15 @@ pub fn encode_header(header: &AvbVBMetaHeader) -> Vec<u8> {
     buf.write_u64::<BigEndian>(header.hash_size).unwrap();
     buf.write_u64::<BigEndian>(header.signature_offset).unwrap();
     buf.write_u64::<BigEndian>(header.signature_size).unwrap();
-    buf.write_u64::<BigEndian>(header.public_key_offset).unwrap();
+    buf.write_u64::<BigEndian>(header.public_key_offset)
+        .unwrap();
     buf.write_u64::<BigEndian>(header.public_key_size).unwrap();
     buf.write_u64::<BigEndian>(header.public_key_metadata_offset)
         .unwrap();
     buf.write_u64::<BigEndian>(header.public_key_metadata_size)
         .unwrap();
-    buf.write_u64::<BigEndian>(header.descriptors_offset).unwrap();
+    buf.write_u64::<BigEndian>(header.descriptors_offset)
+        .unwrap();
     buf.write_u64::<BigEndian>(header.descriptors_size).unwrap();
     buf.write_u64::<BigEndian>(header.rollback_index).unwrap();
     buf.write_u32::<BigEndian>(header.flags).unwrap();
@@ -137,7 +157,8 @@ pub fn encode_footer(footer: &AvbFooter) -> Vec<u8> {
         cursor.write_all(&footer.magic).unwrap();
         cursor.write_u32::<BigEndian>(footer.version_major).unwrap();
         cursor.write_u32::<BigEndian>(footer.version_minor).unwrap();
-        cursor.write_u64::<BigEndian>(footer.original_image_size)
+        cursor
+            .write_u64::<BigEndian>(footer.original_image_size)
             .unwrap();
         cursor.write_u64::<BigEndian>(footer.vbmeta_offset).unwrap();
         cursor.write_u64::<BigEndian>(footer.vbmeta_size).unwrap();

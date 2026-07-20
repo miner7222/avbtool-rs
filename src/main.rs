@@ -5,25 +5,45 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use avbtool_rs::builder::{
-    ChainPartitionSpec, PropertySpec, VbmetaImageArgs, append_vbmeta_image, make_vbmeta_image,
+    BuildSignOptions, ChainPartitionSpec, PropertySpec, VbmetaImageArgs, append_vbmeta_image,
+    make_vbmeta_image_with_options, required_libavb_minor_for_args,
+    update_partition_descriptor_with_options,
 };
-use avbtool_rs::crypto::{extract_public_key, extract_public_key_digest};
+use avbtool_rs::cert::{
+    CERT_USAGE_SIGNING, format_cert_metadata_info, make_cert_metadata,
+    make_cert_permanent_attributes_from_paths, make_cert_unlock_credential_from_paths_with_options,
+    make_certificate_from_paths_with_options, parse_metadata, resolve_builtin_usage,
+};
+use avbtool_rs::cmdline::cmdline_descriptors_for_dm_verity;
+use avbtool_rs::crypto::{
+    SignOptions, check_mldsa_support, extract_public_key, extract_public_key_digest,
+    is_mldsa_algorithm,
+};
 use avbtool_rs::digest::{
     calculate_kernel_cmdline, calculate_vbmeta_digest, print_partition_digests,
 };
 use avbtool_rs::footer::{
-    HashFooterArgs, HashtreeFooterArgs, add_hash_footer, add_hashtree_footer, erase_footer,
+    AVB_DEFAULT_FEC_NUM_ROOTS, FooterBuildOptions, HashFooterArgs, HashtreeFooterArgs,
+    add_hash_footer_with_options, add_hashtree_footer_with_options,
+    calc_max_hash_footer_image_size, calc_max_hashtree_footer_image_size, erase_footer,
     parse_hex_string, resize_image, zero_hashtree,
 };
-use avbtool_rs::info::{generate_info_report, scan_input};
-use avbtool_rs::image::load_vbmeta_blob;
-use avbtool_rs::resign::ResignOutcome;
+use avbtool_rs::image::{extract_public_key_metadata, load_vbmeta_blob};
+use avbtool_rs::info::{InfoRenderOptions, generate_info_report_with_options, scan_input};
+use avbtool_rs::resign::{ResignOutcome, ResignSignOptions, resign_image_with_sign_options};
+use avbtool_rs::sparse::ImageHandler;
 use avbtool_rs::verify::{ExpectedChainPartition, VerifyImageOptions, verify_image};
 use clap::{Parser, Subcommand, ValueEnum};
 use crc32fast::Hasher as Crc32Hasher;
 
+const AVBTOOL_VERSION: &str = "avbtool 1.4.0";
+
 #[derive(Parser, Debug)]
-#[command(name = "avbtool-rs", version, about = "Pure Rust AVB tooling")]
+#[command(
+    name = "avbtool-rs",
+    about = "Pure Rust AVB tooling",
+    disable_version_flag = true
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -48,7 +68,7 @@ enum Commands {
         format: ReportFormat,
         #[arg(short, long)]
         output: Option<PathBuf>,
-        #[arg(long, alias = "atx")]
+        #[arg(long = "cert", alias = "atx", visible_alias = "atx")]
         cert: bool,
         #[arg(long)]
         output_pubkey: Option<PathBuf>,
@@ -94,50 +114,10 @@ enum Commands {
     MakeVbmetaImage {
         #[arg(long)]
         output: Option<PathBuf>,
-        #[arg(long, default_value = "NONE")]
-        algorithm: String,
-        #[arg(long)]
-        key: Option<String>,
-        #[arg(long)]
-        signing_helper: Option<String>,
-        #[arg(long)]
-        signing_helper_with_files: Option<String>,
-        #[arg(long)]
-        public_key_metadata: Option<PathBuf>,
-        #[arg(long, default_value_t = 0)]
-        rollback_index: u64,
-        #[arg(long, default_value_t = 0)]
-        flags: u32,
-        #[arg(long, default_value_t = 0)]
-        rollback_index_location: u32,
-        #[arg(long)]
-        internal_release_string: Option<String>,
-        #[arg(long)]
-        setup_rootfs_from_kernel: Option<PathBuf>,
-        #[arg(long = "prop")]
-        props: Vec<String>,
-        #[arg(long = "prop-from-file")]
-        props_from_file: Vec<String>,
-        #[arg(long = "kernel-cmdline")]
-        kernel_cmdlines: Vec<String>,
-        #[arg(long = "include-descriptors-from-image")]
-        include_descriptors_from_images: Vec<PathBuf>,
-        #[arg(long = "chain-partition")]
-        chain_partitions: Vec<String>,
-        #[arg(long = "chain-partition-do-not-use-ab")]
-        chain_partitions_do_not_use_ab: Vec<String>,
-        #[arg(long)]
-        release_string: Option<String>,
-        #[arg(long)]
-        append_to_release_string: Option<String>,
+        #[command(flatten)]
+        common: CommonArgs,
         #[arg(long, default_value_t = 0)]
         padding_size: u64,
-        #[arg(long)]
-        print_required_libavb_version: bool,
-        #[arg(long)]
-        set_hashtree_disabled_flag: bool,
-        #[arg(long)]
-        set_verification_disabled_flag: bool,
     },
     AppendVbmetaImage {
         #[arg(long)]
@@ -149,70 +129,37 @@ enum Commands {
     },
     AddHashFooter {
         #[arg(long)]
-        image: PathBuf,
+        image: Option<PathBuf>,
         #[arg(long)]
         partition_size: Option<u64>,
         #[arg(long)]
         dynamic_partition_size: bool,
         #[arg(long)]
-        partition_name: String,
+        partition_name: Option<String>,
         #[arg(long, default_value = "sha256")]
         hash_algorithm: String,
         #[arg(long)]
         salt: Option<String>,
         #[arg(long)]
         calc_max_image_size: bool,
-        #[arg(long = "chain-partition")]
-        chain_partitions: Vec<String>,
-        #[arg(long = "chain-partition-do-not-use-ab")]
-        chain_partitions_do_not_use_ab: Vec<String>,
-        #[arg(long, default_value = "NONE")]
-        algorithm: String,
-        #[arg(long)]
-        key: Option<String>,
-        #[arg(long)]
-        signing_helper: Option<String>,
-        #[arg(long)]
-        signing_helper_with_files: Option<String>,
-        #[arg(long)]
-        public_key_metadata: Option<PathBuf>,
-        #[arg(long, default_value_t = 0)]
-        rollback_index: u64,
-        #[arg(long, default_value_t = 0)]
-        flags: u32,
-        #[arg(long, default_value_t = 0)]
-        rollback_index_location: u32,
-        #[arg(long = "prop")]
-        props: Vec<String>,
-        #[arg(long = "prop-from-file")]
-        props_from_file: Vec<String>,
-        #[arg(long = "kernel-cmdline")]
-        kernel_cmdlines: Vec<String>,
-        #[arg(long = "include-descriptors-from-image")]
-        include_descriptors_from_images: Vec<PathBuf>,
-        #[arg(long)]
-        release_string: Option<String>,
-        #[arg(long)]
-        append_to_release_string: Option<String>,
         #[arg(long)]
         output_vbmeta_image: Option<PathBuf>,
         #[arg(long)]
         do_not_append_vbmeta_image: bool,
-        #[arg(long)]
-        use_persistent_digest: bool,
-        #[arg(long)]
-        do_not_use_ab: bool,
-        #[arg(long)]
-        print_required_libavb_version: bool,
+        #[command(flatten)]
+        common: CommonArgs,
+        #[command(flatten)]
+        footer: CommonFooterArgs,
     },
     AddHashtreeFooter {
         #[arg(long)]
-        image: PathBuf,
+        image: Option<PathBuf>,
         #[arg(long)]
         partition_size: Option<u64>,
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         partition_name: String,
-        #[arg(long, default_value = "sha1")]
+        /// Empty default matches AOSP so defaulted sha1 can be distinguished from explicit sha1.
+        #[arg(long, default_value = "")]
         hash_algorithm: String,
         #[arg(long, default_value_t = 4096)]
         block_size: u32,
@@ -220,42 +167,10 @@ enum Commands {
         salt: Option<String>,
         #[arg(long)]
         do_not_generate_fec: bool,
-        #[arg(long, default_value_t = 2)]
+        #[arg(long, default_value_t = AVB_DEFAULT_FEC_NUM_ROOTS)]
         fec_num_roots: u32,
         #[arg(long)]
         calc_max_image_size: bool,
-        #[arg(long = "chain-partition")]
-        chain_partitions: Vec<String>,
-        #[arg(long = "chain-partition-do-not-use-ab")]
-        chain_partitions_do_not_use_ab: Vec<String>,
-        #[arg(long, default_value = "NONE")]
-        algorithm: String,
-        #[arg(long)]
-        key: Option<String>,
-        #[arg(long)]
-        signing_helper: Option<String>,
-        #[arg(long)]
-        signing_helper_with_files: Option<String>,
-        #[arg(long)]
-        public_key_metadata: Option<PathBuf>,
-        #[arg(long, default_value_t = 0)]
-        rollback_index: u64,
-        #[arg(long, default_value_t = 0)]
-        flags: u32,
-        #[arg(long, default_value_t = 0)]
-        rollback_index_location: u32,
-        #[arg(long = "prop")]
-        props: Vec<String>,
-        #[arg(long = "prop-from-file")]
-        props_from_file: Vec<String>,
-        #[arg(long = "kernel-cmdline")]
-        kernel_cmdlines: Vec<String>,
-        #[arg(long = "include-descriptors-from-image")]
-        include_descriptors_from_images: Vec<PathBuf>,
-        #[arg(long)]
-        release_string: Option<String>,
-        #[arg(long)]
-        append_to_release_string: Option<String>,
         #[arg(long)]
         output_vbmeta_image: Option<PathBuf>,
         #[arg(long)]
@@ -263,17 +178,16 @@ enum Commands {
         #[arg(long)]
         setup_as_rootfs_from_kernel: bool,
         #[arg(long)]
-        use_persistent_root_digest: bool,
-        #[arg(long)]
-        do_not_use_ab: bool,
-        #[arg(long)]
         no_hashtree: bool,
         #[arg(long)]
         check_at_most_once: bool,
-        #[arg(long)]
+        /// Deprecated AOSP flag retained for compatibility; FEC is generated by default.
+        #[arg(long, hide = true)]
         generate_fec: bool,
-        #[arg(long)]
-        print_required_libavb_version: bool,
+        #[command(flatten)]
+        common: CommonArgs,
+        #[command(flatten)]
+        footer: CommonFooterArgs,
     },
     EraseFooter {
         #[arg(long)]
@@ -318,10 +232,10 @@ enum Commands {
     ResignImage {
         #[arg(long)]
         image: PathBuf,
-        #[arg(long, default_value = "")]
+        #[arg(long)]
         key: String,
         #[arg(long)]
-        algorithm: Option<String>,
+        algorithm: String,
         #[arg(long)]
         signing_helper: Option<String>,
         #[arg(long)]
@@ -330,6 +244,7 @@ enum Commands {
         auto_resize: bool,
         #[arg(long)]
         rollback_index: Option<u64>,
+        /// Local extension: allow resigning when algorithm/key size would otherwise be rejected.
         #[arg(long)]
         force: bool,
     },
@@ -340,18 +255,8 @@ enum Commands {
         partition_image: PathBuf,
         #[arg(long, short)]
         output: PathBuf,
-        #[arg(long)]
-        key: String,
-        #[arg(long)]
-        algorithm: Option<String>,
-        #[arg(long)]
-        signing_helper: Option<String>,
-        #[arg(long)]
-        signing_helper_with_files: Option<String>,
-        #[arg(long)]
-        rollback_index: Option<u64>,
-        #[arg(long)]
-        flags: Option<u32>,
+        #[command(flatten)]
+        common: CommonArgs,
     },
     SetAbMetadata {
         #[arg(long)]
@@ -359,8 +264,135 @@ enum Commands {
         #[arg(long, default_value = "15:7:0:14:7:0")]
         slot_data: String,
     },
+    #[command(name = "make-certificate", alias = "make-atx-certificate")]
+    MakeCertificate {
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        subject: PathBuf,
+        #[arg(long)]
+        subject_key: PathBuf,
+        #[arg(long)]
+        subject_key_version: Option<u64>,
+        #[arg(long)]
+        subject_is_intermediate_authority: bool,
+        #[arg(long)]
+        usage: Option<String>,
+        #[arg(long)]
+        usage_for_unlock: bool,
+        #[arg(long)]
+        authority_key: Option<PathBuf>,
+        #[arg(long)]
+        signing_helper: Option<String>,
+        #[arg(long)]
+        signing_helper_with_files: Option<String>,
+    },
+    #[command(
+        name = "make-cert-permanent-attributes",
+        alias = "make-atx-permanent-attributes"
+    )]
+    MakeCertPermanentAttributes {
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        root_authority_key: PathBuf,
+        #[arg(long)]
+        product_id: PathBuf,
+    },
+    #[command(name = "make-cert-metadata", alias = "make-atx-metadata")]
+    MakeCertMetadata {
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        intermediate_key_certificate: PathBuf,
+        #[arg(long)]
+        product_key_certificate: PathBuf,
+    },
+    #[command(
+        name = "make-cert-unlock-credential",
+        alias = "make-atx-unlock-credential"
+    )]
+    MakeCertUnlockCredential {
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        intermediate_key_certificate: PathBuf,
+        #[arg(long)]
+        unlock_key_certificate: PathBuf,
+        #[arg(long)]
+        challenge: Option<PathBuf>,
+        #[arg(long)]
+        unlock_key: Option<PathBuf>,
+        #[arg(long)]
+        signing_helper: Option<String>,
+        #[arg(long)]
+        signing_helper_with_files: Option<String>,
+    },
     #[command(external_subcommand)]
     Unsupported(Vec<String>),
+}
+
+#[derive(Parser, Debug, Clone)]
+struct CommonArgs {
+    #[arg(long, default_value = "NONE")]
+    algorithm: String,
+    #[arg(long)]
+    key: Option<String>,
+    #[arg(long)]
+    signing_helper: Option<String>,
+    #[arg(long)]
+    signing_helper_with_files: Option<String>,
+    #[arg(long)]
+    public_key_metadata: Option<PathBuf>,
+    #[arg(long, default_value_t = 0)]
+    rollback_index: u64,
+    #[arg(long, default_value_t = 0)]
+    flags: u32,
+    #[arg(long, default_value_t = 0)]
+    rollback_index_location: u32,
+    #[arg(long, hide = true)]
+    internal_release_string: Option<String>,
+    #[arg(long)]
+    release_string: Option<String>,
+    #[arg(long)]
+    append_to_release_string: Option<String>,
+    #[arg(long = "prop")]
+    props: Vec<String>,
+    #[arg(long = "prop-from-file")]
+    props_from_file: Vec<String>,
+    #[arg(long = "kernel-cmdline")]
+    kernel_cmdlines: Vec<String>,
+    #[arg(
+        long = "setup-rootfs-from-kernel",
+        alias = "generate-dm-verity-cmdline-from-hashtree",
+        visible_alias = "generate_dm_verity_cmdline_from_hashtree"
+    )]
+    setup_rootfs_from_kernel: Option<PathBuf>,
+    #[arg(long = "include-descriptors-from-image")]
+    include_descriptors_from_images: Vec<PathBuf>,
+    #[arg(long)]
+    print_required_libavb_version: bool,
+    #[arg(long = "chain-partition")]
+    chain_partitions: Vec<String>,
+    #[arg(long = "chain-partition-do-not-use-ab")]
+    chain_partitions_do_not_use_ab: Vec<String>,
+    #[arg(long)]
+    set_hashtree_disabled_flag: bool,
+    #[arg(long)]
+    set_verification_disabled_flag: bool,
+}
+
+#[derive(Parser, Debug, Clone)]
+struct CommonFooterArgs {
+    /// AOSP flag name. Local alias: --use_persistent_root_digest.
+    #[arg(
+        long = "use-persistent-digest",
+        alias = "use-persistent-root-digest",
+        visible_alias = "use_persistent_root_digest"
+    )]
+    use_persistent_digest: bool,
+    #[arg(long)]
+    do_not_use_ab: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -387,8 +419,14 @@ fn main() -> anyhow::Result<()> {
 
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        Commands::Version => write_text_output(None, format!("avbtool-rs {}\n", env!("CARGO_PKG_VERSION")).as_bytes()),
-        Commands::CheckMldsaSupport => anyhow::bail!("ML-DSA is NOT supported."),
+        Commands::Version => write_text_output(None, format!("{AVBTOOL_VERSION}\n").as_bytes()),
+        Commands::CheckMldsaSupport => {
+            if check_mldsa_support() {
+                write_text_output(None, b"ML-DSA is supported.\n")
+            } else {
+                anyhow::bail!("ML-DSA is NOT supported.")
+            }
+        }
         Commands::GenerateTestImage {
             image_size,
             start_byte,
@@ -407,18 +445,33 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             cert,
             output_pubkey,
         } => {
-            if cert {
-                anyhow::bail!("--cert/--atx info view is not implemented in pure Rust yet.");
-            }
-            let report = match format {
-                ReportFormat::Text => generate_info_report(&image)?,
-                ReportFormat::Json => serde_json::to_string_pretty(&scan_input(&image)?)?,
-            };
             if let Some(output_pubkey) = output_pubkey {
                 let public_key = extract_embedded_public_key(&image)?;
                 write_binary_output(Some(output_pubkey), &public_key)?;
             }
-            write_text_output(output, report.as_bytes())
+            match format {
+                ReportFormat::Text => {
+                    let sparse = image_is_sparse(&image);
+                    let cert_text = if cert {
+                        Some(load_cert_info_text(&image)?)
+                    } else {
+                        None
+                    };
+                    let report = generate_info_report_with_options(
+                        &image,
+                        &InfoRenderOptions {
+                            sparse,
+                            include_cert: cert,
+                            cert_text,
+                        },
+                    )?;
+                    write_text_output(output, report.as_bytes())
+                }
+                ReportFormat::Json => {
+                    let report = serde_json::to_string_pretty(&scan_input(&image)?)?;
+                    write_text_output(output, report.as_bytes())
+                }
+            }
         }
         Commands::ExtractPublicKey { key, output } => {
             let blob = extract_public_key(&key)?;
@@ -473,100 +526,32 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Commands::MakeVbmetaImage {
             output,
-            algorithm,
-            key,
-            signing_helper,
-            signing_helper_with_files,
-            public_key_metadata,
-            rollback_index,
-            flags,
-            rollback_index_location,
-            internal_release_string,
-            setup_rootfs_from_kernel,
-            props,
-            props_from_file,
-            kernel_cmdlines,
-            include_descriptors_from_images,
-            chain_partitions,
-            chain_partitions_do_not_use_ab,
-            release_string,
-            append_to_release_string,
+            common,
             padding_size,
-            print_required_libavb_version,
-            set_hashtree_disabled_flag,
-            set_verification_disabled_flag,
         } => {
-            reject_unsupported_helper_args(signing_helper, signing_helper_with_files)?;
-            reject_unsupported_option(
-                "setup_rootfs_from_kernel",
-                setup_rootfs_from_kernel.is_some(),
-            )?;
-            let public_key_metadata = public_key_metadata
-                .map(|path| fs::read(path))
-                .transpose()?;
-            let mut properties = props
-                .into_iter()
-                .map(parse_property_spec)
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            properties.extend(
-                props_from_file
-                    .into_iter()
-                    .map(parse_property_file_spec)
-                    .collect::<anyhow::Result<Vec<_>>>()?,
-            );
-            let mut chain_specs = chain_partitions
-                .into_iter()
-                .map(|spec| parse_chain_partition_spec(&spec, 0))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            chain_specs.extend(
-                chain_partitions_do_not_use_ab
-                    .into_iter()
-                    .map(|spec| parse_chain_partition_spec(&spec, 1))
-                    .collect::<anyhow::Result<Vec<_>>>()?,
-            );
-            let mut flags = flags;
-            if set_hashtree_disabled_flag {
-                flags |= 1;
-            }
-            if set_verification_disabled_flag {
-                flags |= 2;
-            }
-            let args = VbmetaImageArgs {
-                algorithm_name: algorithm,
-                key_spec: key,
-                public_key_metadata,
-                rollback_index,
-                flags,
-                rollback_index_location,
-                properties,
-                kernel_cmdlines,
-                extra_descriptors: Vec::new(),
-                include_descriptors_from_images,
-                chain_partitions: chain_specs,
-                release_string: internal_release_string.or(release_string),
-                append_to_release_string,
-                padding_size,
-            };
-            if print_required_libavb_version {
+            let (args, sign_options) = build_vbmeta_args(&common, padding_size, Vec::new())?;
+            if common.print_required_libavb_version {
                 return write_text_output(
                     None,
-                    format!(
-                        "1.{}\n",
-                        avbtool_rs::builder::required_libavb_minor_for_args(&args)
-                    )
-                    .as_bytes(),
+                    format!("1.{}\n", required_libavb_minor_for_args(&args)).as_bytes(),
                 );
             }
             if let Some(output) = output {
-                make_vbmeta_image(&output, &args)?;
+                make_vbmeta_image_with_options(
+                    &output,
+                    &args,
+                    &BuildSignOptions { sign: sign_options },
+                )?;
                 Ok(())
             } else {
-                let mut blob = avbtool_rs::builder::build_vbmeta_blob(&args)?;
+                let mut blob = avbtool_rs::builder::build_vbmeta_blob_with_options(
+                    &args,
+                    &BuildSignOptions { sign: sign_options },
+                )?;
                 if args.padding_size > 0 {
-                    let padded = avbtool_rs::crypto::round_to_multiple(
-                        blob.len() as u64,
-                        args.padding_size,
-                    ) as usize;
+                    let padded =
+                        avbtool_rs::crypto::round_to_multiple(blob.len() as u64, args.padding_size)
+                            as usize;
                     blob.resize(padded, 0);
                 }
                 write_binary_output(None, &blob)
@@ -585,86 +570,38 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             hash_algorithm,
             salt,
             calc_max_image_size,
-            chain_partitions,
-            chain_partitions_do_not_use_ab,
-            algorithm,
-            key,
-            signing_helper,
-            signing_helper_with_files,
-            public_key_metadata,
-            rollback_index,
-            flags,
-            rollback_index_location,
-            props,
-            props_from_file,
-            kernel_cmdlines,
-            include_descriptors_from_images,
-            release_string,
-            append_to_release_string,
             output_vbmeta_image,
             do_not_append_vbmeta_image,
-            use_persistent_digest,
-            do_not_use_ab,
-            print_required_libavb_version,
+            common,
+            footer,
         } => {
-            reject_unsupported_helper_args(signing_helper, signing_helper_with_files)?;
-            if print_required_libavb_version {
+            if dynamic_partition_size && calc_max_image_size {
+                anyhow::bail!("--calc_max_image_size not supported with --dynamic_partition_size");
+            }
+            if common.print_required_libavb_version {
                 let minor = required_minor_for_hash_footer(
-                    rollback_index_location as u64,
-                    !chain_partitions_do_not_use_ab.is_empty(),
-                    use_persistent_digest || do_not_use_ab,
+                    common.rollback_index_location,
+                    !common.chain_partitions_do_not_use_ab.is_empty(),
+                    footer.use_persistent_digest || footer.do_not_use_ab,
+                    &common.algorithm,
                 );
                 return write_text_output(None, format!("1.{minor}\n").as_bytes());
             }
             if calc_max_image_size {
-                let max = calc_max_hash_footer_image_size(
-                    partition_size,
-                    &partition_name,
-                    &hash_algorithm,
-                    algorithm.as_str(),
-                    key.as_deref(),
-                    public_key_metadata.as_deref(),
-                    props.as_slice(),
-                    props_from_file.as_slice(),
-                    kernel_cmdlines.as_slice(),
-                    include_descriptors_from_images.as_slice(),
-                    chain_partitions.as_slice(),
-                    chain_partitions_do_not_use_ab.as_slice(),
-                    rollback_index,
-                    flags,
-                    rollback_index_location as u64,
-                    release_string.clone(),
-                    append_to_release_string.clone(),
-                    use_persistent_digest,
-                    do_not_use_ab,
-                )?;
+                let partition_size =
+                    partition_size.ok_or_else(|| anyhow::anyhow!("partition_size required"))?;
+                let max = calc_max_hash_footer_image_size(partition_size)?;
                 return write_text_output(None, format!("{max}\n").as_bytes());
             }
-            let public_key_metadata = public_key_metadata
-                .map(|path| fs::read(path))
-                .transpose()?;
-            let mut properties = props
-                .into_iter()
-                .map(parse_property_spec)
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            properties.extend(
-                props_from_file
-                    .into_iter()
-                    .map(parse_property_file_spec)
-                    .collect::<anyhow::Result<Vec<_>>>()?,
-            );
-            let mut chain_specs = chain_partitions
-                .into_iter()
-                .map(|spec| parse_chain_partition_spec(&spec, 0))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            chain_specs.extend(
-                chain_partitions_do_not_use_ab
-                    .into_iter()
-                    .map(|spec| parse_chain_partition_spec(&spec, 1))
-                    .collect::<anyhow::Result<Vec<_>>>()?,
-            );
+
+            let image =
+                image.ok_or_else(|| anyhow::anyhow!("--image is required for add_hash_footer"))?;
+            let partition_name = partition_name.ok_or_else(|| {
+                anyhow::anyhow!("--partition_name is required for add_hash_footer")
+            })?;
+            let (vbmeta_common, sign_options) = build_vbmeta_args(&common, 0, Vec::new())?;
             let salt = salt.map(|value| parse_hex_string(&value)).transpose()?;
-            add_hash_footer(
+            add_hash_footer_with_options(
                 &image,
                 &HashFooterArgs {
                     partition_size,
@@ -672,22 +609,27 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     partition_name,
                     hash_algorithm,
                     salt,
-                    chain_partitions: chain_specs,
-                    algorithm_name: algorithm,
-                    key_spec: key,
-                    public_key_metadata,
-                    rollback_index,
-                    flags,
-                    rollback_index_location,
-                    properties,
-                    kernel_cmdlines,
-                    include_descriptors_from_images,
-                    release_string,
-                    append_to_release_string,
+                    chain_partitions: vbmeta_common.chain_partitions,
+                    algorithm_name: vbmeta_common.algorithm_name,
+                    key_spec: vbmeta_common.key_spec,
+                    public_key_metadata: vbmeta_common.public_key_metadata,
+                    rollback_index: vbmeta_common.rollback_index,
+                    flags: vbmeta_common.flags,
+                    rollback_index_location: vbmeta_common.rollback_index_location,
+                    properties: vbmeta_common.properties,
+                    kernel_cmdlines: vbmeta_common.kernel_cmdlines,
+                    include_descriptors_from_images: vbmeta_common.include_descriptors_from_images,
+                    release_string: vbmeta_common.release_string,
+                    append_to_release_string: vbmeta_common.append_to_release_string,
                     output_vbmeta_image,
                     do_not_append_vbmeta_image,
-                    use_persistent_digest,
-                    do_not_use_ab,
+                    use_persistent_digest: footer.use_persistent_digest,
+                    do_not_use_ab: footer.do_not_use_ab,
+                },
+                &FooterBuildOptions {
+                    build: BuildSignOptions { sign: sign_options },
+                    extra_descriptors: vbmeta_common.extra_descriptors,
+                    setup_as_rootfs_from_kernel: false,
                 },
             )
             .map_err(Into::into)
@@ -696,76 +638,63 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             image,
             partition_size,
             partition_name,
-            hash_algorithm,
+            mut hash_algorithm,
             block_size,
             salt,
             do_not_generate_fec,
             fec_num_roots,
             calc_max_image_size,
-            chain_partitions,
-            chain_partitions_do_not_use_ab,
-            algorithm,
-            key,
-            signing_helper,
-            signing_helper_with_files,
-            public_key_metadata,
-            rollback_index,
-            flags,
-            rollback_index_location,
-            props,
-            props_from_file,
-            kernel_cmdlines,
-            include_descriptors_from_images,
-            release_string,
-            append_to_release_string,
             output_vbmeta_image,
             do_not_append_vbmeta_image,
             setup_as_rootfs_from_kernel,
-            use_persistent_root_digest,
-            do_not_use_ab,
             no_hashtree,
             check_at_most_once,
             generate_fec,
-            print_required_libavb_version,
+            common,
+            footer,
         } => {
-            reject_unsupported_helper_args(signing_helper, signing_helper_with_files)?;
-            reject_unsupported_option("setup_as_rootfs_from_kernel", setup_as_rootfs_from_kernel)?;
-            let generate_fec = generate_fec || !do_not_generate_fec;
-            reject_unsupported_option("fec_num_roots", fec_num_roots != 2)?;
-            if print_required_libavb_version {
+            if generate_fec {
+                eprintln!(
+                    "The --generate_fec option is deprecated since FEC is now generated by default. Use the option --do_not_generate_fec to not generate FEC."
+                );
+            }
+            if hash_algorithm.is_empty() {
+                hash_algorithm = "sha1".to_string();
+                if !calc_max_image_size {
+                    eprintln!(
+                        "Warning: 'avbtool add_hashtree_footer' executed without an explicit\n--hash_algorithm option. Defaulting to sha1 for backwards compatibility.\nPlease use '--hash_algorithm sha256'."
+                    );
+                }
+            }
+            let generate_fec = !do_not_generate_fec;
+
+            if common.print_required_libavb_version {
                 let minor = required_minor_for_hashtree_footer(
-                    rollback_index_location as u64,
-                    !chain_partitions_do_not_use_ab.is_empty(),
-                    use_persistent_root_digest || do_not_use_ab || check_at_most_once,
+                    common.rollback_index_location,
+                    !common.chain_partitions_do_not_use_ab.is_empty(),
+                    footer.use_persistent_digest || footer.do_not_use_ab || check_at_most_once,
+                    &common.algorithm,
                 );
                 return write_text_output(None, format!("1.{minor}\n").as_bytes());
             }
-            reject_unsupported_option("calc_max_image_size", calc_max_image_size)?;
-            let public_key_metadata = public_key_metadata
-                .map(|path| fs::read(path))
-                .transpose()?;
-            let mut properties = props
-                .into_iter()
-                .map(parse_property_spec)
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            properties.extend(
-                props_from_file
-                    .into_iter()
-                    .map(parse_property_file_spec)
-                    .collect::<anyhow::Result<Vec<_>>>()?,
-            );
-            let mut chain_specs = chain_partitions
-                .into_iter()
-                .map(|spec| parse_chain_partition_spec(&spec, 0))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            chain_specs.extend(
-                chain_partitions_do_not_use_ab
-                    .into_iter()
-                    .map(|spec| parse_chain_partition_spec(&spec, 1))
-                    .collect::<anyhow::Result<Vec<_>>>()?,
-            );
+            if calc_max_image_size {
+                let partition_size = partition_size.unwrap_or(0);
+                let max = calc_max_hashtree_footer_image_size(
+                    partition_size,
+                    block_size as u64,
+                    &hash_algorithm,
+                    generate_fec,
+                    fec_num_roots,
+                    no_hashtree,
+                )?;
+                return write_text_output(None, format!("{max}\n").as_bytes());
+            }
+
+            let image = image
+                .ok_or_else(|| anyhow::anyhow!("--image is required for add_hashtree_footer"))?;
+            let (vbmeta_common, sign_options) = build_vbmeta_args(&common, 0, Vec::new())?;
             let salt = salt.map(|value| parse_hex_string(&value)).transpose()?;
-            add_hashtree_footer(
+            add_hashtree_footer_with_options(
                 &image,
                 &HashtreeFooterArgs {
                     partition_size,
@@ -773,25 +702,31 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     hash_algorithm,
                     block_size,
                     salt,
-                    chain_partitions: chain_specs,
-                    algorithm_name: algorithm,
-                    key_spec: key,
-                    public_key_metadata,
-                    rollback_index,
-                    flags,
-                    rollback_index_location,
-                    properties,
-                    kernel_cmdlines,
-                    include_descriptors_from_images,
-                    release_string,
-                    append_to_release_string,
+                    chain_partitions: vbmeta_common.chain_partitions,
+                    algorithm_name: vbmeta_common.algorithm_name,
+                    key_spec: vbmeta_common.key_spec,
+                    public_key_metadata: vbmeta_common.public_key_metadata,
+                    rollback_index: vbmeta_common.rollback_index,
+                    flags: vbmeta_common.flags,
+                    rollback_index_location: vbmeta_common.rollback_index_location,
+                    properties: vbmeta_common.properties,
+                    kernel_cmdlines: vbmeta_common.kernel_cmdlines,
+                    include_descriptors_from_images: vbmeta_common.include_descriptors_from_images,
+                    release_string: vbmeta_common.release_string,
+                    append_to_release_string: vbmeta_common.append_to_release_string,
                     output_vbmeta_image,
                     do_not_append_vbmeta_image,
-                    use_persistent_root_digest,
-                    do_not_use_ab,
+                    use_persistent_root_digest: footer.use_persistent_digest,
+                    do_not_use_ab: footer.do_not_use_ab,
                     no_hashtree,
                     check_at_most_once,
                     generate_fec,
+                    fec_num_roots,
+                },
+                &FooterBuildOptions {
+                    build: BuildSignOptions { sign: sign_options },
+                    extra_descriptors: vbmeta_common.extra_descriptors,
+                    setup_as_rootfs_from_kernel,
                 },
             )
             .map_err(Into::into)
@@ -808,7 +743,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         } => {
             let mut blob = load_vbmeta_blob(&image)?;
             if padding_size > 0 {
-                let padded = avbtool_rs::crypto::round_to_multiple(blob.len() as u64, padding_size) as usize;
+                let padded =
+                    avbtool_rs::crypto::round_to_multiple(blob.len() as u64, padding_size) as usize;
                 blob.resize(padded, 0);
             }
             write_binary_output(output, &blob)
@@ -856,14 +792,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             rollback_index,
             force,
         } => {
-            reject_unsupported_helper_args(signing_helper, signing_helper_with_files)?;
-            match avbtool_rs::resign::resign_image_with_options(
+            let sign =
+                build_sign_options(Some(key.clone()), signing_helper, signing_helper_with_files)?;
+            match resign_image_with_sign_options(
                 &image,
                 &key,
-                algorithm.as_deref(),
+                Some(algorithm.as_str()),
                 force,
                 rollback_index,
                 auto_resize,
+                &ResignSignOptions { sign },
             )? {
                 ResignOutcome::Resigned | ResignOutcome::SkippedUnsigned => Ok(()),
             }
@@ -872,37 +810,234 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             image,
             partition_image,
             output,
-            key,
-            algorithm,
-            signing_helper,
-            signing_helper_with_files,
-            rollback_index,
-            flags,
+            common,
         } => {
-            reject_unsupported_helper_args(signing_helper, signing_helper_with_files)?;
-            avbtool_rs::builder::rebuild_vbmeta_image_with_overrides(
-                &output,
+            let (args, sign_options) = build_vbmeta_args(&common, 0, Vec::new())?;
+            if common.print_required_libavb_version {
+                let result = update_partition_descriptor_with_options(
+                    &image,
+                    &partition_image,
+                    &args,
+                    &BuildSignOptions { sign: sign_options },
+                )?;
+                return write_text_output(
+                    None,
+                    format!("1.{}\n", result.required_libavb_version_minor).as_bytes(),
+                );
+            }
+            let result = update_partition_descriptor_with_options(
                 &image,
-                &[partition_image.as_path()],
-                &key,
-                algorithm.as_deref(),
-                rollback_index,
-                flags,
+                &partition_image,
+                &args,
+                &BuildSignOptions { sign: sign_options },
             )?;
-            Ok(())
+            write_binary_output(Some(output), &result.blob)
         }
         Commands::SetAbMetadata {
             misc_image,
             slot_data,
         } => set_ab_metadata(&misc_image, &slot_data),
+        Commands::MakeCertificate {
+            output,
+            subject,
+            subject_key,
+            subject_key_version,
+            subject_is_intermediate_authority,
+            usage,
+            usage_for_unlock,
+            authority_key,
+            signing_helper,
+            signing_helper_with_files,
+        } => {
+            let usage = if let Some(usage) = usage {
+                usage
+            } else {
+                resolve_builtin_usage(subject_is_intermediate_authority, usage_for_unlock)
+                    .unwrap_or(CERT_USAGE_SIGNING)
+                    .to_string()
+            };
+            let subject_bytes = fs::read(&subject)
+                .with_context(|| format!("Failed to read {}", subject.display()))?;
+            let blob = make_certificate_from_paths_with_options(
+                &subject_key,
+                &subject_bytes,
+                &usage,
+                subject_key_version,
+                authority_key.as_deref(),
+                signing_helper.map(PathBuf::from),
+                signing_helper_with_files.map(PathBuf::from),
+            )?;
+            write_binary_output(output, &blob)
+        }
+        Commands::MakeCertPermanentAttributes {
+            output,
+            root_authority_key,
+            product_id,
+        } => {
+            let product_id = fs::read(&product_id)
+                .with_context(|| format!("Failed to read {}", product_id.display()))?;
+            let blob = make_cert_permanent_attributes_from_paths(&root_authority_key, &product_id)?;
+            write_binary_output(output, &blob)
+        }
+        Commands::MakeCertMetadata {
+            output,
+            intermediate_key_certificate,
+            product_key_certificate,
+        } => {
+            let intermediate = fs::read(&intermediate_key_certificate).with_context(|| {
+                format!("Failed to read {}", intermediate_key_certificate.display())
+            })?;
+            let product = fs::read(&product_key_certificate)
+                .with_context(|| format!("Failed to read {}", product_key_certificate.display()))?;
+            let blob = make_cert_metadata(&intermediate, &product)?;
+            write_binary_output(output, &blob)
+        }
+        Commands::MakeCertUnlockCredential {
+            output,
+            intermediate_key_certificate,
+            unlock_key_certificate,
+            challenge,
+            unlock_key,
+            signing_helper,
+            signing_helper_with_files,
+        } => {
+            let intermediate = fs::read(&intermediate_key_certificate).with_context(|| {
+                format!("Failed to read {}", intermediate_key_certificate.display())
+            })?;
+            let unlock_cert = fs::read(&unlock_key_certificate)
+                .with_context(|| format!("Failed to read {}", unlock_key_certificate.display()))?;
+            let challenge_bytes = challenge
+                .as_ref()
+                .map(|path| {
+                    fs::read(path).with_context(|| format!("Failed to read {}", path.display()))
+                })
+                .transpose()?;
+            let blob = make_cert_unlock_credential_from_paths_with_options(
+                &intermediate,
+                &unlock_cert,
+                challenge_bytes.as_deref(),
+                unlock_key.as_deref(),
+                signing_helper.map(PathBuf::from),
+                signing_helper_with_files.map(PathBuf::from),
+            )?;
+            write_binary_output(output, &blob)
+        }
         Commands::Unsupported(args) => {
-            let command = args.first().cloned().unwrap_or_else(|| "<unknown>".to_string());
+            let command = args
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "<unknown>".to_string());
             anyhow::bail!(
                 "Subcommand '{}' is not implemented in avbtool-rs yet.",
                 command
             )
         }
     }
+}
+
+fn build_vbmeta_args(
+    common: &CommonArgs,
+    padding_size: u64,
+    mut extra_descriptors: Vec<avbtool_rs::info::DescriptorInfo>,
+) -> anyhow::Result<(VbmetaImageArgs, SignOptions)> {
+    let public_key_metadata = common
+        .public_key_metadata
+        .as_ref()
+        .map(fs::read)
+        .transpose()?;
+    let mut properties = common
+        .props
+        .iter()
+        .cloned()
+        .map(parse_property_spec)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    properties.extend(
+        common
+            .props_from_file
+            .iter()
+            .cloned()
+            .map(parse_property_file_spec)
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    );
+    let mut chain_specs = common
+        .chain_partitions
+        .iter()
+        .map(|spec| parse_chain_partition_spec(spec, 0))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    chain_specs.extend(
+        common
+            .chain_partitions_do_not_use_ab
+            .iter()
+            .map(|spec| parse_chain_partition_spec(spec, 1))
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    );
+
+    if let Some(setup_image) = &common.setup_rootfs_from_kernel {
+        let info = avbtool_rs::image::inspect_avb_image(setup_image)?;
+        let pair = cmdline_descriptors_for_dm_verity(&info.descriptors)?;
+        extra_descriptors.extend(pair);
+    }
+
+    let mut flags = common.flags;
+    if common.set_hashtree_disabled_flag {
+        flags |= 1;
+    }
+    if common.set_verification_disabled_flag {
+        flags |= 2;
+    }
+
+    let release_string = common
+        .internal_release_string
+        .clone()
+        .or_else(|| common.release_string.clone());
+
+    let args = VbmetaImageArgs {
+        algorithm_name: common.algorithm.clone(),
+        key_spec: common.key.clone(),
+        public_key_metadata,
+        rollback_index: common.rollback_index,
+        flags,
+        rollback_index_location: common.rollback_index_location,
+        properties,
+        kernel_cmdlines: common.kernel_cmdlines.clone(),
+        extra_descriptors,
+        include_descriptors_from_images: common.include_descriptors_from_images.clone(),
+        chain_partitions: chain_specs,
+        release_string,
+        append_to_release_string: common.append_to_release_string.clone(),
+        padding_size,
+    };
+    let sign = build_sign_options(
+        common.key.clone(),
+        common.signing_helper.clone(),
+        common.signing_helper_with_files.clone(),
+    )?;
+    Ok((args, sign))
+}
+
+fn build_sign_options(
+    key: Option<String>,
+    signing_helper: Option<String>,
+    signing_helper_with_files: Option<String>,
+) -> anyhow::Result<SignOptions> {
+    let helper = signing_helper.map(PathBuf::from);
+    let helper_files = signing_helper_with_files.map(PathBuf::from);
+    let key_path = if helper.is_some() || helper_files.is_some() {
+        let key = key.ok_or_else(|| {
+            anyhow::anyhow!("signing helper requires --key with a filesystem path")
+        })?;
+        if key.starts_with("testkey_") {
+            anyhow::bail!("signing helper requires --key with a filesystem path, not embedded key");
+        }
+        Some(PathBuf::from(key))
+    } else {
+        None
+    };
+    Ok(SignOptions {
+        signing_helper: helper,
+        signing_helper_with_files: helper_files,
+        key_path,
+    })
 }
 
 fn parse_property_spec(spec: String) -> anyhow::Result<PropertySpec> {
@@ -917,7 +1052,7 @@ fn parse_property_file_spec(spec: String) -> anyhow::Result<PropertySpec> {
     let (key, path) = split_once_required(&spec, ':', "property file")?;
     Ok(PropertySpec {
         key: key.to_string(),
-        value: fs::read(path).with_context(|| format!("Failed to read {}", path))?,
+        value: fs::read(path).with_context(|| format!("Failed to read {path}"))?,
     })
 }
 
@@ -928,14 +1063,13 @@ fn parse_chain_partition_spec(spec: &str, flags: u32) -> anyhow::Result<ChainPar
     let key_path = parts.next().unwrap_or_default();
     if partition_name.is_empty() || rollback_index_location.is_empty() || key_path.is_empty() {
         anyhow::bail!(
-            "Malformed chain partition spec '{}'. Expected PARTITION:ROLLBACK_SLOT:KEY_PATH",
-            spec
+            "Malformed chain partition spec '{spec}'. Expected PARTITION:ROLLBACK_SLOT:KEY_PATH"
         );
     }
     Ok(ChainPartitionSpec {
         partition_name: partition_name.to_string(),
         rollback_index_location: rollback_index_location.parse()?,
-        public_key: fs::read(key_path).with_context(|| format!("Failed to read {}", key_path))?,
+        public_key: fs::read(key_path).with_context(|| format!("Failed to read {key_path}"))?,
         flags,
     })
 }
@@ -947,7 +1081,7 @@ fn parse_expected_chain_partition_spec(spec: String) -> anyhow::Result<ExpectedC
     Ok(ExpectedChainPartition {
         partition_name: partition_name.to_string(),
         rollback_index_location: rollback_index_location.parse()?,
-        public_key: fs::read(key_path).with_context(|| format!("Failed to read {}", key_path))?,
+        public_key: fs::read(key_path).with_context(|| format!("Failed to read {key_path}"))?,
     })
 }
 
@@ -958,7 +1092,7 @@ fn split_once_required<'a>(
 ) -> anyhow::Result<(&'a str, &'a str)> {
     value
         .split_once(separator)
-        .ok_or_else(|| anyhow::anyhow!("Malformed {} spec '{}'", label, value))
+        .ok_or_else(|| anyhow::anyhow!("Malformed {label} spec '{value}'"))
 }
 
 fn write_text_output(output: Option<PathBuf>, bytes: &[u8]) -> anyhow::Result<()> {
@@ -982,10 +1116,11 @@ fn write_binary_output(output: Option<PathBuf>, bytes: &[u8]) -> anyhow::Result<
 }
 
 fn ensure_parent_dir(path: &Path) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
     }
     Ok(())
 }
@@ -1023,21 +1158,6 @@ fn normalize_flag_arg(arg: OsString) -> OsString {
     }
 }
 
-fn reject_unsupported_helper_args(
-    signing_helper: Option<String>,
-    signing_helper_with_files: Option<String>,
-) -> anyhow::Result<()> {
-    reject_unsupported_option("signing_helper", signing_helper.is_some())?;
-    reject_unsupported_option("signing_helper_with_files", signing_helper_with_files.is_some())
-}
-
-fn reject_unsupported_option(name: &str, used: bool) -> anyhow::Result<()> {
-    if used {
-        anyhow::bail!("Option '{}' is not implemented in pure Rust yet.", name);
-    }
-    Ok(())
-}
-
 fn extract_embedded_public_key(image: &Path) -> anyhow::Result<Vec<u8>> {
     let info = avbtool_rs::image::inspect_avb_image(image)?;
     let blob = load_vbmeta_blob(image)?;
@@ -1050,10 +1170,28 @@ fn extract_embedded_public_key(image: &Path) -> anyhow::Result<Vec<u8>> {
     Ok(blob[public_key_offset..public_key_end].to_vec())
 }
 
+fn load_cert_info_text(image: &Path) -> anyhow::Result<String> {
+    let info = avbtool_rs::image::inspect_avb_image(image)?;
+    let blob = load_vbmeta_blob(image)?;
+    let metadata = extract_public_key_metadata(&info.header, &blob)?;
+    if metadata.is_empty() {
+        return Ok(String::new());
+    }
+    let parsed = parse_metadata(&metadata)?;
+    Ok(format_cert_metadata_info(&parsed))
+}
+
+fn image_is_sparse(image: &Path) -> bool {
+    ImageHandler::open(image, true)
+        .map(|handler| handler.is_sparse())
+        .unwrap_or(false)
+}
+
 fn required_minor_for_hash_footer(
-    rollback_index_location: u64,
+    rollback_index_location: u32,
     has_chain_partition_do_not_use_ab: bool,
     persistent_or_do_not_use_ab: bool,
+    algorithm: &str,
 ) -> u32 {
     let mut minor = 0;
     if persistent_or_do_not_use_ab {
@@ -1065,13 +1203,17 @@ fn required_minor_for_hash_footer(
     if has_chain_partition_do_not_use_ab {
         minor = 3;
     }
+    if is_mldsa_algorithm(algorithm) {
+        minor = 4;
+    }
     minor
 }
 
 fn required_minor_for_hashtree_footer(
-    rollback_index_location: u64,
+    rollback_index_location: u32,
     has_chain_partition_do_not_use_ab: bool,
     flag_minor_one: bool,
+    algorithm: &str,
 ) -> u32 {
     let mut minor = 0;
     if flag_minor_one {
@@ -1083,95 +1225,16 @@ fn required_minor_for_hashtree_footer(
     if has_chain_partition_do_not_use_ab {
         minor = 3;
     }
-    minor
-}
-
-#[allow(clippy::too_many_arguments)]
-fn calc_max_hash_footer_image_size(
-    partition_size: Option<u64>,
-    partition_name: &str,
-    hash_algorithm: &str,
-    algorithm: &str,
-    key: Option<&str>,
-    public_key_metadata: Option<&Path>,
-    props: &[String],
-    props_from_file: &[String],
-    kernel_cmdlines: &[String],
-    include_descriptors_from_images: &[PathBuf],
-    chain_partitions: &[String],
-    chain_partitions_do_not_use_ab: &[String],
-    rollback_index: u64,
-    flags: u32,
-    rollback_index_location: u64,
-    release_string: Option<String>,
-    append_to_release_string: Option<String>,
-    use_persistent_digest: bool,
-    do_not_use_ab: bool,
-) -> anyhow::Result<u64> {
-    let partition_size = partition_size.ok_or_else(|| anyhow::anyhow!("partition_size required"))?;
-    let public_key_metadata = public_key_metadata.map(fs::read).transpose()?;
-    let mut properties = props
-        .iter()
-        .cloned()
-        .map(parse_property_spec)
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    properties.extend(
-        props_from_file
-            .iter()
-            .cloned()
-            .map(parse_property_file_spec)
-            .collect::<anyhow::Result<Vec<_>>>()?,
-    );
-    let mut chain_specs = chain_partitions
-        .iter()
-        .map(|spec| parse_chain_partition_spec(spec, 0))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    chain_specs.extend(
-        chain_partitions_do_not_use_ab
-            .iter()
-            .map(|spec| parse_chain_partition_spec(spec, 1))
-            .collect::<anyhow::Result<Vec<_>>>()?,
-    );
-    let digest_size = avbtool_rs::footer::hash_digest_size(hash_algorithm)?;
-    let mut descriptor_flags = 0u32;
-    if do_not_use_ab {
-        descriptor_flags |= 1;
+    if is_mldsa_algorithm(algorithm) {
+        minor = 4;
     }
-    let vbmeta = avbtool_rs::builder::build_vbmeta_blob(&VbmetaImageArgs {
-        algorithm_name: algorithm.to_string(),
-        key_spec: key.map(str::to_string),
-        public_key_metadata,
-        rollback_index,
-        flags,
-        rollback_index_location: rollback_index_location as u32,
-        properties,
-        kernel_cmdlines: kernel_cmdlines.to_vec(),
-        extra_descriptors: vec![avbtool_rs::info::DescriptorInfo::Hash {
-            image_size: 0,
-            hash_algorithm: hash_algorithm.to_string(),
-            partition_name: partition_name.to_string(),
-            salt: vec![0u8; digest_size],
-            digest: if use_persistent_digest {
-                Vec::new()
-            } else {
-                vec![0u8; digest_size]
-            },
-            flags: descriptor_flags,
-        }],
-        include_descriptors_from_images: include_descriptors_from_images.to_vec(),
-        chain_partitions: chain_specs,
-        release_string,
-        append_to_release_string,
-        padding_size: 0,
-    })?;
-    let metadata = avbtool_rs::crypto::round_to_multiple(vbmeta.len() as u64, 4096) + 4096;
-    Ok(partition_size.saturating_sub(metadata))
+    minor
 }
 
 fn set_ab_metadata(misc_image: &Path, slot_data: &str) -> anyhow::Result<()> {
     let tokens = slot_data.split(':').collect::<Vec<_>>();
     if tokens.len() != 6 {
-        anyhow::bail!("Malformed slot data '{}'.", slot_data);
+        anyhow::bail!("Malformed slot data '{slot_data}'.");
     }
     let values = tokens
         .iter()
@@ -1208,4 +1271,425 @@ fn set_ab_metadata(misc_image: &Path, slot_data: &str) -> anyhow::Result<()> {
     file.seek(std::io::SeekFrom::Start(2048))?;
     file.write_all(&payload)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn parse_cli<I, T>(args: I) -> Cli
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let normalized = normalize_cli_args(args.into_iter().map(Into::into));
+        Cli::try_parse_from(normalized).expect("parse cli")
+    }
+
+    fn parse_cli_err<I, T>(args: I) -> clap::Error
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let normalized = normalize_cli_args(args.into_iter().map(Into::into));
+        Cli::try_parse_from(normalized).expect_err("expected parse error")
+    }
+
+    #[test]
+    fn version_command_parses() {
+        let cli = parse_cli(["avbtool-rs", "version"]);
+        assert!(matches!(cli.command, Commands::Version));
+    }
+
+    #[test]
+    fn check_mldsa_support_parses() {
+        let cli = parse_cli(["avbtool-rs", "check_mldsa_support"]);
+        assert!(matches!(cli.command, Commands::CheckMldsaSupport));
+    }
+
+    #[test]
+    fn normalize_accepts_underscore_commands_and_flags() {
+        let args = normalize_cli_args([
+            OsString::from("avbtool-rs"),
+            OsString::from("info_image"),
+            OsString::from("--print_required_libavb_version"),
+            OsString::from("--use_persistent_digest"),
+        ]);
+        assert_eq!(args[1], "info-image");
+        assert_eq!(args[2], "--print-required-libavb-version");
+        assert_eq!(args[3], "--use-persistent-digest");
+    }
+
+    #[test]
+    fn info_image_accepts_cert_and_atx_aliases() {
+        for flag in ["--cert", "--atx"] {
+            let cli = parse_cli(["avbtool-rs", "info_image", "--image", "x.img", flag]);
+            match cli.command {
+                Commands::InfoImage { cert, .. } => assert!(cert),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn resign_image_requires_algorithm() {
+        let err = parse_cli_err([
+            "avbtool-rs",
+            "resign_image",
+            "--image",
+            "x.img",
+            "--key",
+            "k.pem",
+        ]);
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("algorithm") || rendered.contains("--algorithm"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn make_certificate_aliases_parse() {
+        for command in ["make_certificate", "make_atx_certificate"] {
+            let cli = parse_cli([
+                "avbtool-rs",
+                command,
+                "--subject",
+                "subject.bin",
+                "--subject_key",
+                "subject.pem",
+                "--authority_key",
+                "auth.pem",
+            ]);
+            assert!(matches!(cli.command, Commands::MakeCertificate { .. }));
+        }
+    }
+
+    #[test]
+    fn permanent_attributes_aliases_parse() {
+        for command in [
+            "make_cert_permanent_attributes",
+            "make_atx_permanent_attributes",
+        ] {
+            let cli = parse_cli([
+                "avbtool-rs",
+                command,
+                "--root_authority_key",
+                "root.pem",
+                "--product_id",
+                "product.bin",
+            ]);
+            assert!(matches!(
+                cli.command,
+                Commands::MakeCertPermanentAttributes { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn metadata_and_unlock_aliases_parse() {
+        let metadata = parse_cli([
+            "avbtool-rs",
+            "make_atx_metadata",
+            "--intermediate_key_certificate",
+            "i.cert",
+            "--product_key_certificate",
+            "p.cert",
+        ]);
+        assert!(matches!(
+            metadata.command,
+            Commands::MakeCertMetadata { .. }
+        ));
+
+        let unlock = parse_cli([
+            "avbtool-rs",
+            "make_atx_unlock_credential",
+            "--intermediate_key_certificate",
+            "i.cert",
+            "--unlock_key_certificate",
+            "u.cert",
+        ]);
+        assert!(matches!(
+            unlock.command,
+            Commands::MakeCertUnlockCredential { .. }
+        ));
+    }
+
+    #[test]
+    fn add_hashtree_footer_accepts_fec_num_roots_and_setup_flags() {
+        let cli = parse_cli([
+            "avbtool-rs",
+            "add_hashtree_footer",
+            "--image",
+            "system.img",
+            "--partition_size",
+            "4096",
+            "--partition_name",
+            "system",
+            "--fec_num_roots",
+            "4",
+            "--setup_as_rootfs_from_kernel",
+            "--use_persistent_digest",
+            "--setup_rootfs_from_kernel",
+            "ht.img",
+            "--set_hashtree_disabled_flag",
+            "--set_verification_disabled_flag",
+            "--internal_release_string",
+            "avbtool 1.4.0",
+        ]);
+        match cli.command {
+            Commands::AddHashtreeFooter {
+                fec_num_roots,
+                setup_as_rootfs_from_kernel,
+                footer,
+                common,
+                ..
+            } => {
+                assert_eq!(fec_num_roots, 4);
+                assert!(setup_as_rootfs_from_kernel);
+                assert!(footer.use_persistent_digest);
+                assert!(common.setup_rootfs_from_kernel.is_some());
+                assert!(common.set_hashtree_disabled_flag);
+                assert!(common.set_verification_disabled_flag);
+                assert_eq!(
+                    common.internal_release_string.as_deref(),
+                    Some("avbtool 1.4.0")
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn footer_calculation_and_version_only_forms_do_not_require_mutation_args() {
+        let hash_calc = parse_cli([
+            "avbtool-rs",
+            "add_hash_footer",
+            "--partition_size",
+            "69632",
+            "--calc_max_image_size",
+        ]);
+        match &hash_calc.command {
+            Commands::AddHashFooter {
+                image,
+                partition_size,
+                partition_name,
+                calc_max_image_size,
+                ..
+            } => {
+                assert!(image.is_none());
+                assert!(partition_name.is_none());
+                assert!(*calc_max_image_size);
+                assert_eq!(
+                    calc_max_hash_footer_image_size(partition_size.unwrap()).unwrap(),
+                    0
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        run(hash_calc).unwrap();
+
+        let hash_version = parse_cli([
+            "avbtool-rs",
+            "add_hash_footer",
+            "--partition_size",
+            "69632",
+            "--print_required_libavb_version",
+        ]);
+        match &hash_version.command {
+            Commands::AddHashFooter {
+                image,
+                partition_name,
+                common,
+                ..
+            } => {
+                assert!(image.is_none());
+                assert!(partition_name.is_none());
+                assert!(common.print_required_libavb_version);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        run(hash_version).unwrap();
+
+        let hashtree_calc = parse_cli([
+            "avbtool-rs",
+            "add_hashtree_footer",
+            "--partition_size",
+            "69632",
+            "--calc_max_image_size",
+        ]);
+        match &hashtree_calc.command {
+            Commands::AddHashtreeFooter {
+                image,
+                partition_size,
+                partition_name,
+                hash_algorithm,
+                block_size,
+                do_not_generate_fec,
+                fec_num_roots,
+                calc_max_image_size,
+                no_hashtree,
+                ..
+            } => {
+                assert!(image.is_none());
+                assert!(partition_name.is_empty());
+                assert!(hash_algorithm.is_empty());
+                assert!(*calc_max_image_size);
+                assert_eq!(
+                    calc_max_hashtree_footer_image_size(
+                        partition_size.unwrap(),
+                        u64::from(*block_size),
+                        "sha1",
+                        !*do_not_generate_fec,
+                        *fec_num_roots,
+                        *no_hashtree,
+                    )
+                    .unwrap(),
+                    0
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        run(hashtree_calc).unwrap();
+
+        let hashtree_version = parse_cli([
+            "avbtool-rs",
+            "add_hashtree_footer",
+            "--print_required_libavb_version",
+        ]);
+        match &hashtree_version.command {
+            Commands::AddHashtreeFooter {
+                image,
+                partition_name,
+                common,
+                ..
+            } => {
+                assert!(image.is_none());
+                assert!(partition_name.is_empty());
+                assert!(common.print_required_libavb_version);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        run(hashtree_version).unwrap();
+    }
+
+    #[test]
+    fn footer_mutations_validate_runtime_only_args() {
+        let hash_image_err = run(parse_cli([
+            "avbtool-rs",
+            "add_hash_footer",
+            "--partition_size",
+            "131072",
+            "--partition_name",
+            "boot",
+        ]))
+        .unwrap_err();
+        assert_eq!(
+            hash_image_err.to_string(),
+            "--image is required for add_hash_footer"
+        );
+
+        let hash_name_err = run(parse_cli([
+            "avbtool-rs",
+            "add_hash_footer",
+            "--image",
+            "unused.img",
+            "--partition_size",
+            "131072",
+        ]))
+        .unwrap_err();
+        assert_eq!(
+            hash_name_err.to_string(),
+            "--partition_name is required for add_hash_footer"
+        );
+
+        let hashtree_image_err = run(parse_cli([
+            "avbtool-rs",
+            "add_hashtree_footer",
+            "--partition_name",
+            "system",
+            "--hash_algorithm",
+            "sha256",
+        ]))
+        .unwrap_err();
+        assert_eq!(
+            hashtree_image_err.to_string(),
+            "--image is required for add_hashtree_footer"
+        );
+    }
+
+    #[test]
+    fn footer_calc_partition_size_semantics_match_aosp() {
+        let hash_err = run(parse_cli([
+            "avbtool-rs",
+            "add_hash_footer",
+            "--calc_max_image_size",
+        ]))
+        .unwrap_err();
+        assert!(hash_err.to_string().contains("partition_size required"));
+
+        let hashtree_calc =
+            parse_cli(["avbtool-rs", "add_hashtree_footer", "--calc_max_image_size"]);
+        assert!(matches!(
+            &hashtree_calc.command,
+            Commands::AddHashtreeFooter {
+                image: None,
+                partition_size: None,
+                calc_max_image_size: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            calc_max_hashtree_footer_image_size(
+                0,
+                4096,
+                "sha1",
+                true,
+                AVB_DEFAULT_FEC_NUM_ROOTS,
+                false,
+            )
+            .unwrap(),
+            0
+        );
+        run(hashtree_calc).unwrap();
+    }
+
+    #[test]
+    fn update_partition_descriptor_accepts_common_args() {
+        let cli = parse_cli([
+            "avbtool-rs",
+            "update_partition_descriptor",
+            "--image",
+            "vbmeta.img",
+            "--partition_image",
+            "boot.img",
+            "--output",
+            "out.img",
+            "--algorithm",
+            "SHA256_RSA2048",
+            "--key",
+            "key.pem",
+            "--prop",
+            "a:b",
+            "--setup_rootfs_from_kernel",
+            "root.img",
+            "--print_required_libavb_version",
+        ]);
+        match cli.command {
+            Commands::UpdatePartitionDescriptor { common, .. } => {
+                assert_eq!(common.algorithm, "SHA256_RSA2048");
+                assert_eq!(common.key.as_deref(), Some("key.pem"));
+                assert!(common.print_required_libavb_version);
+                assert_eq!(common.props, vec!["a:b".to_string()]);
+                assert!(common.setup_rootfs_from_kernel.is_some());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_command_tree_builds() {
+        Cli::command().debug_assert();
+    }
 }

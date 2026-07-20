@@ -1,10 +1,10 @@
 use byteorder::{BigEndian, ReadBytesExt};
 use serde::Serialize;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::Path;
 
 use crate::error::{AvbToolError as DynoError, Result};
+use crate::sparse::ImageHandler;
 
 pub const AVB_MAGIC: &[u8; 4] = b"AVB0";
 pub const AVB_FOOTER_MAGIC: &[u8; 4] = b"AVBf";
@@ -136,29 +136,37 @@ impl AvbFooter {
 }
 
 pub fn detect_avb_image_type(path: &Path) -> Result<AvbImageType> {
-    let mut file = File::open(path)?;
-    let file_size = file.metadata()?.len();
+    let mut image = ImageHandler::open(path, true).map_err(sparse_err)?;
+    let image_size = image.image_size();
 
-    // 1. Check for AVB0 at the beginning
-    if file_size >= 4 {
-        let mut header_magic = [0u8; 4];
-        file.read_exact(&mut header_magic)?;
-        if &header_magic == AVB_MAGIC {
+    // 1. Check for AVB0 at the beginning of the logical image.
+    if image_size >= 4 {
+        image.seek(0).map_err(sparse_err)?;
+        let header_magic = image.read(4).map_err(sparse_err)?;
+        if header_magic.as_slice() == AVB_MAGIC {
             return Ok(AvbImageType::Vbmeta);
         }
     }
 
-    // 2. Check for AVBf at the end
-    if file_size >= AVB_FOOTER_SIZE {
-        file.seek(SeekFrom::End(-(AVB_FOOTER_SIZE as i64)))?;
-        let mut footer_magic = [0u8; 4];
-        file.read_exact(&mut footer_magic)?;
-        if &footer_magic == AVB_FOOTER_MAGIC {
+    // 2. Check for AVBf at the end of the logical image.
+    if image_size >= AVB_FOOTER_SIZE {
+        image
+            .seek(image_size - AVB_FOOTER_SIZE)
+            .map_err(sparse_err)?;
+        let footer_magic = image.read(4).map_err(sparse_err)?;
+        if footer_magic.as_slice() == AVB_FOOTER_MAGIC {
             return Ok(AvbImageType::Footer);
         }
     }
 
     Ok(AvbImageType::None)
+}
+
+pub(crate) fn sparse_err(err: crate::sparse::SparseError) -> DynoError {
+    match err {
+        crate::sparse::SparseError::Io(io) => DynoError::Io(io),
+        other => DynoError::Tool(other.to_string()),
+    }
 }
 
 #[cfg(test)]
