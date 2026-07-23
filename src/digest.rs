@@ -62,7 +62,10 @@ fn collect_vbmeta_blobs_recursive(path: &Path, blobs: &mut Vec<Vec<u8>>) -> Resu
     let info = inspect_avb_image(path)?;
     for descriptor in info.descriptors {
         if let DescriptorInfo::ChainPartition { partition_name, .. } = descriptor {
-            collect_vbmeta_blobs_recursive(&chained_image_path(path, &partition_name), blobs)?;
+            collect_vbmeta_blobs_recursive(
+                &chain_partition_image_path(path, &partition_name),
+                blobs,
+            )?;
         }
     }
     Ok(())
@@ -78,7 +81,7 @@ fn collect_kernel_cmdlines_recursive(path: &Path, snippets: &mut Vec<(u32, Strin
             } => snippets.push((flags, kernel_cmdline)),
             DescriptorInfo::ChainPartition { partition_name, .. } => {
                 collect_kernel_cmdlines_recursive(
-                    &chained_image_path(path, &partition_name),
+                    &chain_partition_image_path(path, &partition_name),
                     snippets,
                 )?;
             }
@@ -107,7 +110,7 @@ fn collect_partition_digests_recursive(
             } => entries.push((partition_name, bytes_to_hex(&root_digest))),
             DescriptorInfo::ChainPartition { partition_name, .. } => {
                 collect_partition_digests_recursive(
-                    &chained_image_path(path, &partition_name),
+                    &chain_partition_image_path(path, &partition_name),
                     entries,
                 )?;
             }
@@ -117,7 +120,8 @@ fn collect_partition_digests_recursive(
     Ok(())
 }
 
-fn chained_image_path(parent_image: &Path, partition_name: &str) -> PathBuf {
+/// Resolve the sibling image path for a ChainPartition descriptor target.
+fn chain_partition_image_path(parent_image: &Path, partition_name: &str) -> PathBuf {
     let image_dir = parent_image.parent().unwrap_or_else(|| Path::new("."));
     let extension = parent_image
         .extension()

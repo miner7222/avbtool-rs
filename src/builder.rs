@@ -120,17 +120,24 @@ pub fn make_vbmeta_image_with_options(
     Ok(())
 }
 
+/// Rebuild and resign a VBMeta image from an existing one.
+///
+/// Matching Hash/Hashtree descriptors are imported from the supplied
+/// `partition_images` (existing descriptors obtained from each partition image,
+/// not recalculated from raw content). Source-image footers are not added or
+/// updated. All other descriptors are preserved, including chain partition
+/// descriptors and their trusted public keys.
 pub fn rebuild_vbmeta_image(
     output_path: &Path,
     original_vbmeta_path: &Path,
-    chained_images: &[&Path],
+    partition_images: &[&Path],
     key_spec: &str,
     algorithm_name: Option<&str>,
 ) -> Result<()> {
     rebuild_vbmeta_image_with_overrides(
         output_path,
         original_vbmeta_path,
-        chained_images,
+        partition_images,
         key_spec,
         algorithm_name,
         None,
@@ -138,10 +145,11 @@ pub fn rebuild_vbmeta_image(
     )
 }
 
+/// Like [`rebuild_vbmeta_image`], with optional rollback-index and flag overrides.
 pub fn rebuild_vbmeta_image_with_overrides(
     output_path: &Path,
     original_vbmeta_path: &Path,
-    chained_images: &[&Path],
+    partition_images: &[&Path],
     key_spec: &str,
     algorithm_name: Option<&str>,
     rollback_index: Option<u64>,
@@ -150,7 +158,7 @@ pub fn rebuild_vbmeta_image_with_overrides(
     rebuild_vbmeta_image_with_options(
         output_path,
         original_vbmeta_path,
-        chained_images,
+        partition_images,
         key_spec,
         algorithm_name,
         rollback_index,
@@ -159,11 +167,12 @@ pub fn rebuild_vbmeta_image_with_overrides(
     )
 }
 
+/// Like [`rebuild_vbmeta_image_with_overrides`], with explicit signing options.
 #[allow(clippy::too_many_arguments)]
 pub fn rebuild_vbmeta_image_with_options(
     output_path: &Path,
     original_vbmeta_path: &Path,
-    chained_images: &[&Path],
+    partition_images: &[&Path],
     key_spec: &str,
     algorithm_name: Option<&str>,
     rollback_index: Option<u64>,
@@ -175,7 +184,7 @@ pub fn rebuild_vbmeta_image_with_options(
     let pkmd = extract_public_key_metadata(&original_info.header, &original_blob)?;
 
     let mut descriptors = original_info.descriptors.clone();
-    let replacement_map = build_descriptor_replacement_map(chained_images)?;
+    let replacement_map = build_descriptor_replacement_map(partition_images)?;
     replace_descriptors_from_images(&mut descriptors, &replacement_map);
 
     let args = VbmetaImageArgs {
@@ -203,13 +212,15 @@ pub fn rebuild_vbmeta_image_with_options(
     Ok(())
 }
 
-/// Replace the matching hash/hashtree descriptor in a vbmeta image with the one
-/// from `partition_image`, then rebuild/sign using `args`.
+/// Replace the matching Hash/Hashtree descriptor in a VBMeta image with the one
+/// obtained from `partition_image`, then rebuild/sign using `args`.
 ///
-/// Matches upstream update_partition_descriptor common-arg semantics as far as
-/// current builder types allow: replace the single matching Hash/Hashtree
-/// descriptor, preserve remaining original descriptors, then append any
-/// properties/cmdlines/chains/include descriptors supplied via `args`.
+/// Matches upstream `update_partition_descriptor` common-arg behavior as far as
+/// current builder types allow: import the single matching Hash/Hashtree
+/// descriptor from the partition image, preserve remaining original descriptors
+/// (including chain partition descriptors), then append any properties, kernel
+/// cmdlines, chain partition descriptors, or include-image descriptors supplied
+/// via `args`.
 pub fn update_partition_descriptor(
     vbmeta_image: &Path,
     partition_image: &Path,
@@ -694,9 +705,16 @@ fn collect_extra_descriptors(descriptors: &[DescriptorInfo]) -> Vec<DescriptorIn
         .collect()
 }
 
-fn build_descriptor_replacement_map(images: &[&Path]) -> Result<BTreeMap<String, DescriptorInfo>> {
+/// Collect Hash/Hashtree descriptors from partition images by partition name.
+///
+/// Descriptors are copied as-is from each partition image. They are not
+/// recalculated from raw partition content, and source-image footers are not
+/// added or updated.
+fn build_descriptor_replacement_map(
+    partition_images: &[&Path],
+) -> Result<BTreeMap<String, DescriptorInfo>> {
     let mut map = BTreeMap::new();
-    for image in images {
+    for image in partition_images {
         let info = inspect_avb_image(image)?;
         for descriptor in info.descriptors {
             match &descriptor {

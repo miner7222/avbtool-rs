@@ -610,17 +610,24 @@ fn lookup_algorithm_by_type(algorithm_type: u32) -> Result<crate::crypto::AvbAlg
     crate::crypto::lookup_algorithm_by_type(algorithm_type)
 }
 
+/// Forwarding wrapper for [`crate::builder::rebuild_vbmeta_image`].
+///
+/// Matching Hash/Hashtree descriptors are imported from the supplied
+/// `partition_images` (existing descriptors obtained from each partition image,
+/// not recalculated from raw content). Source-image footers are not added or
+/// updated. Remaining descriptors are preserved, including chain partition
+/// descriptors and their trusted public keys.
 pub fn rebuild_vbmeta_image(
     output_path: &Path,
     original_vbmeta_path: &Path,
-    chained_images: &[&Path],
+    partition_images: &[&Path],
     key_spec: &str,
     algorithm_name: Option<&str>,
 ) -> Result<()> {
     crate::builder::rebuild_vbmeta_image(
         output_path,
         original_vbmeta_path,
-        chained_images,
+        partition_images,
         key_spec,
         algorithm_name,
     )
